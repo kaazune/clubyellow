@@ -140,10 +140,10 @@ const yobiTagsOf = (girls) => {
   );
   return tags;
 };
-// 📸マーク：呼びの左右を色分け表示
+// 呼びマーク：「呼び左」「呼び右」を色分け表示
 const YobiMark = ({ poses }) => (
-  <span style={{ fontSize: "0.9em" }}>
-    <span style={{ color: posColor(poses[0]) }}>📸</span>
+  <span style={{ fontSize: "0.85em", fontWeight: 700 }}>
+    <span style={{ color: posColor(poses[0]) }}>呼び</span>
     {poses.map((p, k) => (p ? <span key={k} style={{ color: posColor(p) }}>{p}</span> : null))}
   </span>
 );
@@ -213,18 +213,21 @@ const Toggle = ({ on, onChange, disabled }) => (
   </button>
 );
 
-const PosBadge = ({ pos, small }) =>
-  pos ? (
+const PosBadge = ({ pos, small }) => {
+  if (!pos) return null;
+  const col = posColor(pos);
+  return (
     <span
       style={{
-        color: C.cyan, border: `1px solid ${C.cyan}55`, background: `${C.cyan}10`,
+        color: col, border: `1px solid ${col}55`, background: `${col}10`,
         borderRadius: 4, padding: small ? "0px 5px" : "2px 8px",
         fontSize: small ? 10 : 12, fontWeight: 700, flexShrink: 0,
       }}
     >
       {pos}
     </span>
-  ) : null;
+  );
+};
 
 const Sheet = ({ children, onClose }) => (
   <div
@@ -715,19 +718,21 @@ function TsukemawashiBoard() {
             <span style={{ fontSize: 10, color: C.cyan, marginLeft: 5, fontFamily: "'Zen Kaku Gothic New', sans-serif" }}>
               {ses.girls.length}名初回
             </span>
-            <span style={{ fontSize: 11, color: C.muted, marginLeft: 5, fontFamily: "'Zen Kaku Gothic New', sans-serif" }}>
+          </span>
+          <span style={{ display: "flex", alignItems: "baseline", gap: 6 }}>
+            <span style={{ fontSize: 13, color: C.muted, fontWeight: 700, fontFamily: "'Zen Kaku Gothic New', sans-serif" }}>
               ⟳{turn}
             </span>
-          </span>
-          <span
-            style={{
-              fontFamily: "Oswald, sans-serif", fontSize: 16, fontWeight: 500,
-              color: over || empty ? C.red : C.goldBright,
-            }}
-          >
-            {empty
-              ? `無人 ${fmt(now - (ses.emptySince || ses.seatedAt))}`
-              : over ? `+${fmt(-rotRem)}` : fmt(rotRem)}
+            <span
+              style={{
+                fontFamily: "Oswald, sans-serif", fontSize: 21, fontWeight: 600,
+                color: over || empty ? C.red : C.goldBright,
+              }}
+            >
+              {empty
+                ? `無人 ${fmt(now - (ses.emptySince || ses.seatedAt))}`
+                : over ? `+${fmt(-rotRem)}` : fmt(rotRem)}
+            </span>
           </span>
         </div>
 
@@ -745,7 +750,18 @@ function TsukemawashiBoard() {
                 {g.name && <span style={{ color: C.cyan, fontSize: 10 }}>{g.name}</span>}
                 {ys.length > 0 && (
                   <span style={{ color: posColor(g.pos || ""), fontSize: 9 }}>
-                    📸{ys.map((id) => nameOf(id) + (visited.includes(id) ? "✓" : "")).join("・")}
+                    呼び
+                    {ys.map((id, k) => (
+                      <span
+                        key={id}
+                        style={{
+                          textDecoration: visited.includes(id) ? "line-through" : "none",
+                          opacity: visited.includes(id) ? 0.55 : 1,
+                        }}
+                      >
+                        {k > 0 ? "・" : ""}{nameOf(id)}
+                      </span>
+                    ))}
                   </span>
                 )}
               </div>
@@ -753,7 +769,11 @@ function TsukemawashiBoard() {
           })}
         </div>
 
-        <div style={{ display: "flex", flexWrap: "wrap", gap: "2px 8px" }}>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: "2px 8px", alignItems: "baseline" }}>
+          <span style={{ color: C.muted, fontSize: 10, fontWeight: 700 }}>現在▸</span>
+          {ses.hostIds.length === 0 && (
+            <span style={{ fontSize: 12, fontWeight: 700, color: C.red }}>なし</span>
+          )}
           {ses.hostIds.map((id) => {
             const poses = tags[id];
             return (
@@ -1069,7 +1089,7 @@ function TsukemawashiBoard() {
                       <PosBadge pos={g.pos} small />
                       <span style={{ color: C.cyan }}>{g.name || "お客様"}</span>
                       {g.yobiNames.length > 0 && (
-                        <span style={{ color: posColor(g.pos || ""), fontSize: 11 }}>📸 {g.yobiNames.join("・")}</span>
+                        <span style={{ color: posColor(g.pos || ""), fontSize: 11 }}>呼び {g.yobiNames.join("・")}</span>
                       )}
                       <span style={{ fontSize: 11, marginLeft: "auto" }}>
                         <span style={{ color: C.muted }}>送り：</span>
@@ -1655,8 +1675,19 @@ const DetailSheet = ({ tableId, ses, readOnly, clampMin, setTableRotateMin, host
             <span style={{ fontSize: 14, fontWeight: 700, color: C.cyan }}>{g.name || "お客様"}</span>
             {ys.length > 0 && (
               <span style={{ fontSize: 12, color: posColor(g.pos || ""), fontWeight: 700 }}>
-                📸 {ys.map((id) => nameOf(id) + (visited.includes(id) ? "✓" : "")).join("・")}
-                <span style={{ fontSize: 9, color: C.muted, marginLeft: 4 }}>✓=着席済</span>
+                呼び{" "}
+                {ys.map((id, k) => (
+                  <span
+                    key={id}
+                    style={{
+                      textDecoration: visited.includes(id) ? "line-through" : "none",
+                      opacity: visited.includes(id) ? 0.55 : 1,
+                    }}
+                  >
+                    {k > 0 ? "・" : ""}{nameOf(id)}
+                  </span>
+                ))}
+                <span style={{ fontSize: 9, color: C.muted, marginLeft: 4 }}>線=着席済</span>
               </span>
             )}
           </div>
@@ -1957,7 +1988,18 @@ const RotateForm = ({ tableId, ses, pickerHosts, seatMap, hostById, onSubmit }) 
               <span style={{ fontSize: 11, color: C.cyan, fontWeight: 700 }}>{g.name || "お客様"}</span>
               {ys.length > 0 && (
                 <span style={{ fontSize: 10, color: posColor(g.pos || "") }}>
-                  📸{ys.map((id) => nameOf(id) + (visitedIds.includes(id) ? "✓" : "")).join("・")}
+                  呼び
+                  {ys.map((id, k) => (
+                    <span
+                      key={id}
+                      style={{
+                        textDecoration: visitedIds.includes(id) ? "line-through" : "none",
+                        opacity: visitedIds.includes(id) ? 0.55 : 1,
+                      }}
+                    >
+                      {k > 0 ? "・" : ""}{nameOf(id)}
+                    </span>
+                  ))}
                 </span>
               )}
             </div>
