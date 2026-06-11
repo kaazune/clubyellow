@@ -140,10 +140,10 @@ const yobiTagsOf = (girls) => {
   );
   return tags;
 };
-// 呼びマーク：「呼び左」「呼び右」を色分け表示
+// 呼びマーク：📸＋色付き左右（ホスト名の横に付ける）
 const YobiMark = ({ poses }) => (
-  <span style={{ fontSize: "0.85em", fontWeight: 700 }}>
-    <span style={{ color: posColor(poses[0]) }}>呼び</span>
+  <span style={{ fontSize: "0.9em", fontWeight: 700 }}>
+    <span style={{ color: posColor(poses[0]) }}>📸</span>
     {poses.map((p, k) => (p ? <span key={k} style={{ color: posColor(p) }}>{p}</span> : null))}
   </span>
 );
@@ -606,6 +606,17 @@ function TsukemawashiBoard() {
     setModal({ type: "detail", tableId });
   };
 
+  // このホストがどこかの卓の予定に入っているか（次/その次）
+  const reserveNotesOf = (hid) => {
+    const notes = [];
+    Object.entries(sessions).forEach(([tid, se]) => {
+      const r = se.reserved || [];
+      if ((r[0] || []).includes(hid)) notes.push(`次 ${tid}`);
+      if ((r[1] || []).includes(hid)) notes.push(`次々 ${tid}`);
+    });
+    return notes;
+  };
+
   const removeLogEntry = (id) => {
     setLog((l) => l.filter((e) => e.id !== id));
     setConfirmDeleteLog(null);
@@ -695,6 +706,7 @@ function TsukemawashiBoard() {
     const setRem = SET_MS - (now - ses.startedAt);
     const tags = yobiTagsOf(ses.girls);
     const next = (ses.reserved || [])[0];
+    const next2 = (ses.reserved || [])[1];
     const empty = ses.hostIds.length === 0;
     const alert = over || empty;
     return (
@@ -740,7 +752,10 @@ function TsukemawashiBoard() {
           {setRem >= 0 ? `初回あと ${fmt(setRem)}` : `初回超過 ${fmt(-setRem)}`}
         </div>
 
-        <div style={{ display: "flex", flexWrap: "wrap", gap: "2px 10px" }}>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: "2px 10px", alignItems: "center" }}>
+          {ses.girls.some((g) => (g.yobiIds || []).length > 0) && (
+            <span style={{ fontSize: 9, color: C.muted, fontWeight: 700, alignSelf: "center" }}>呼び</span>
+          )}
           {ses.girls.map((g, i) => {
             const visited = ses.history.flatMap((t) => t.hostIds);
             const ys = (g.yobiIds || []).filter((id) => nameOf(id) !== "—");
@@ -750,7 +765,6 @@ function TsukemawashiBoard() {
                 {g.name && <span style={{ color: C.cyan, fontSize: 10 }}>{g.name}</span>}
                 {ys.length > 0 && (
                   <span style={{ color: posColor(g.pos || ""), fontSize: 9 }}>
-                    呼び
                     {ys.map((id, k) => (
                       <span
                         key={id}
@@ -784,19 +798,28 @@ function TsukemawashiBoard() {
           })}
         </div>
 
-        {next && next.length > 0 && (
-          <div
-            style={{
-              fontSize: 13, fontWeight: 700,
-              borderTop: `1px solid ${C.line}`, paddingTop: 4, marginTop: 1,
-            }}
-          >
-            <span style={{ color: C.gold, fontSize: 11 }}>次▸ </span>
-            {next.map((id, k) => (
-              <span key={id} style={{ color: C.goldBright }}>
-                {k > 0 && "・"}{tags[id] && <YobiMark poses={tags[id]} />}{nameOf(id)}
-              </span>
-            ))}
+        {((next && next.length > 0) || (next2 && next2.length > 0)) && (
+          <div style={{ borderTop: `1px solid ${C.line}`, paddingTop: 4, marginTop: 1 }}>
+            {next && next.length > 0 && (
+              <div style={{ fontSize: 13, fontWeight: 700 }}>
+                <span style={{ color: C.gold, fontSize: 11 }}>次▸ </span>
+                {next.map((id, k) => (
+                  <span key={id} style={{ color: C.goldBright }}>
+                    {k > 0 && "・"}{tags[id] && <YobiMark poses={tags[id]} />}{nameOf(id)}
+                  </span>
+                ))}
+              </div>
+            )}
+            {next2 && next2.length > 0 && (
+              <div style={{ fontSize: 11, fontWeight: 700, marginTop: 1 }}>
+                <span style={{ color: C.muted, fontSize: 10 }}>その次▸ </span>
+                {next2.map((id, k) => (
+                  <span key={id} style={{ color: `${C.goldBright}AA` }}>
+                    {k > 0 && "・"}{tags[id] && <YobiMark poses={tags[id]} />}{nameOf(id)}
+                  </span>
+                ))}
+              </div>
+            )}
           </div>
         )}
 
@@ -1234,7 +1257,15 @@ function TsukemawashiBoard() {
                         {h.name}
                       </div>
 
-                      <div style={{ marginLeft: "auto", fontSize: 11, color: tid ? C.goldBright : C.muted, flexShrink: 0 }}>
+                      {reserveNotesOf(h.id).length > 0 && (
+                        <div style={{ marginLeft: "auto", fontSize: 10, color: C.gold, fontWeight: 700, flexShrink: 0, textAlign: "right", lineHeight: 1.4 }}>
+                          {reserveNotesOf(h.id).map((n, k) => (
+                            <div key={k}>{n}</div>
+                          ))}
+                        </div>
+                      )}
+
+                      <div style={{ marginLeft: reserveNotesOf(h.id).length > 0 ? 0 : "auto", fontSize: 11, color: tid ? C.goldBright : C.muted, flexShrink: 0 }}>
                         {tid ? `${tid} 着席中` : h.active ? "出勤" : "休み"}
                       </div>
 
@@ -1675,7 +1706,7 @@ const DetailSheet = ({ tableId, ses, readOnly, clampMin, setTableRotateMin, host
             <span style={{ fontSize: 14, fontWeight: 700, color: C.cyan }}>{g.name || "お客様"}</span>
             {ys.length > 0 && (
               <span style={{ fontSize: 12, color: posColor(g.pos || ""), fontWeight: 700 }}>
-                呼び{" "}
+                <span style={{ fontSize: 10, color: C.muted, marginRight: 3 }}>呼び</span>
                 {ys.map((id, k) => (
                   <span
                     key={id}
@@ -1979,7 +2010,10 @@ const RotateForm = ({ tableId, ses, pickerHosts, seatMap, hostById, onSubmit }) 
         </div>
       )}
 
-      <div style={{ display: "flex", flexWrap: "wrap", gap: "4px 14px", marginBottom: 12 }}>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: "4px 14px", marginBottom: 12, alignItems: "center" }}>
+        {ses.girls.some((g) => (g.yobiIds || []).length > 0) && (
+          <span style={{ fontSize: 10, color: C.muted, fontWeight: 700 }}>呼び</span>
+        )}
         {ses.girls.map((g, i) => {
           const ys = (g.yobiIds || []).filter((id) => nameOf(id) !== "—");
           return (
@@ -1988,7 +2022,6 @@ const RotateForm = ({ tableId, ses, pickerHosts, seatMap, hostById, onSubmit }) 
               <span style={{ fontSize: 11, color: C.cyan, fontWeight: 700 }}>{g.name || "お客様"}</span>
               {ys.length > 0 && (
                 <span style={{ fontSize: 10, color: posColor(g.pos || "") }}>
-                  呼び
                   {ys.map((id, k) => (
                     <span
                       key={id}
