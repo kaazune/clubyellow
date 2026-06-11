@@ -606,13 +606,19 @@ function TsukemawashiBoard() {
     setModal({ type: "detail", tableId });
   };
 
-  // このホストがどこかの卓の予定に入っているか（次/その次）
+  // このホストがどこかの卓の予定に入っているか（約何分後かも逆算）
   const reserveNotesOf = (hid) => {
     const notes = [];
     Object.entries(sessions).forEach(([tid, se]) => {
       const r = se.reserved || [];
-      if ((r[0] || []).includes(hid)) notes.push(`次 ${tid}`);
-      if ((r[1] || []).includes(hid)) notes.push(`次々 ${tid}`);
+      const limit = clampMin(se.rotateMin) * 60 * 1000;
+      const rem = limit - (now - se.seatedAt);
+      const eta = (ms) => {
+        const m = Math.ceil(ms / 60000);
+        return m <= 0 ? "まもなく" : `約${m}分後`;
+      };
+      if ((r[0] || []).includes(hid)) notes.push(`${eta(rem)} 次 ${tid}`);
+      if ((r[1] || []).includes(hid)) notes.push(`${eta(rem + limit)} 次の次 ${tid}`);
     });
     return notes;
   };
@@ -676,28 +682,10 @@ function TsukemawashiBoard() {
   const pickerHosts = [...pickable, ...activeHosts.filter((h) => h.status === "seated")];
   const emptyTables = tableIds.filter((t) => !sessions[t]);
 
-  // 卓カード描画
+  // 卓カード描画（使用中のみ・横幅いっぱい）
   const renderTableCard = (tid) => {
     const ses = sessions[tid];
-    if (!ses) {
-      return (
-        <button
-          key={tid}
-          onClick={() => !readOnly && setModal({ type: "seat", tableId: tid })}
-          style={{
-            background: "transparent", border: `1px dashed ${C.line}`,
-            borderRadius: 10, padding: "12px 8px", cursor: "pointer",
-            display: "flex", alignItems: "center", justifyContent: "space-between",
-            fontFamily: "'Zen Kaku Gothic New', sans-serif",
-          }}
-        >
-          <span style={{ fontFamily: "Oswald, sans-serif", fontSize: 17, fontWeight: 600, color: C.muted }}>
-            {tid}
-          </span>
-          <span style={{ fontSize: 10, color: `${C.muted}99` }}>空</span>
-        </button>
-      );
-    }
+    if (!ses) return null;
     const limit = clampMin(ses.rotateMin) * 60 * 1000;
     const rotRem = limit - (now - ses.seatedAt);
     const over = rotRem < 0;
@@ -709,35 +697,53 @@ function TsukemawashiBoard() {
     const next2 = (ses.reserved || [])[1];
     const empty = ses.hostIds.length === 0;
     const alert = over || empty;
+    const visited = ses.history.flatMap((t) => t.hostIds);
+
+    // 現在/次/その次：ラベルも名前も同じ大きさ・同じ色（呼びの左右マークだけ色付き）
+    const hostRow = (label, ids) => (
+      <div key={label} style={{ display: "flex", flexWrap: "wrap", gap: "2px 8px", alignItems: "baseline" }}>
+        <span style={{ color: C.muted, fontSize: 12, fontWeight: 700, width: 54, flexShrink: 0 }}>{label}</span>
+        {ids.length === 0 && label === "現在▸" && (
+          <span style={{ fontSize: 13, fontWeight: 700, color: C.red }}>なし</span>
+        )}
+        {ids.map((id) => (
+          <span key={id} style={{ fontSize: 13, fontWeight: 700, color: C.text }}>
+            {tags[id] && <YobiMark poses={tags[id]} />}
+            {nameOf(id)}
+          </span>
+        ))}
+      </div>
+    );
+
     return (
       <button
         key={tid}
         onClick={() => setModal({ type: "detail", tableId: tid })}
         style={{
+          width: "100%",
           background: alert ? C.redBg : C.surface,
           border: alert ? `2px solid ${C.red}` : `1px solid ${C.gold}55`,
           animation: alert ? "alertPulse 1.2s ease-in-out infinite" : "none",
-          borderRadius: 10, padding: alert ? "9px 9px 7px" : "10px 10px 8px",
+          borderRadius: 10, padding: "12px 12px 10px",
           cursor: "pointer", textAlign: "left",
-          display: "flex", flexDirection: "column", gap: 5,
+          display: "flex", flexDirection: "column", gap: 7,
           fontFamily: "'Zen Kaku Gothic New', sans-serif",
           transition: "border-color 0.4s, background 0.4s",
         }}
       >
         <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between" }}>
-          <span style={{ fontFamily: "Oswald, sans-serif", fontSize: 17, fontWeight: 600, color: C.text }}>
-            {tid}
-            <span style={{ fontSize: 10, color: C.cyan, marginLeft: 5, fontFamily: "'Zen Kaku Gothic New', sans-serif" }}>
-              {ses.girls.length}名初回
+          <span style={{ display: "flex", alignItems: "baseline", gap: 8, minWidth: 0 }}>
+            <span style={{ fontFamily: "Oswald, sans-serif", fontSize: 19, fontWeight: 600, color: C.text }}>{tid}</span>
+            <span style={{ fontSize: 11, color: C.cyan, fontWeight: 700 }}>{ses.girls.length}名初回</span>
+            <span style={{ fontSize: 11, fontWeight: 700, color: setRem >= 0 ? C.cyan : C.red }}>
+              {setRem >= 0 ? `初回あと ${fmt(setRem)}` : `初回超過 ${fmt(-setRem)}`}
             </span>
           </span>
-          <span style={{ display: "flex", alignItems: "baseline", gap: 6 }}>
-            <span style={{ fontSize: 13, color: C.muted, fontWeight: 700, fontFamily: "'Zen Kaku Gothic New', sans-serif" }}>
-              ⟳{turn}
-            </span>
+          <span style={{ display: "flex", alignItems: "baseline", gap: 12, flexShrink: 0 }}>
+            <span style={{ fontSize: 16, color: C.muted, fontWeight: 700 }}>⟳{turn}</span>
             <span
               style={{
-                fontFamily: "Oswald, sans-serif", fontSize: 21, fontWeight: 600,
+                fontFamily: "Oswald, sans-serif", fontSize: 22, fontWeight: 600,
                 color: over || empty ? C.red : C.goldBright,
               }}
             >
@@ -748,80 +754,42 @@ function TsukemawashiBoard() {
           </span>
         </div>
 
-        <div style={{ fontSize: 10, fontWeight: 700, color: setRem >= 0 ? C.cyan : C.red }}>
-          {setRem >= 0 ? `初回あと ${fmt(setRem)}` : `初回超過 ${fmt(-setRem)}`}
-        </div>
-
-        <div style={{ display: "flex", flexWrap: "wrap", gap: "2px 10px", alignItems: "center" }}>
-          {ses.girls.some((g) => (g.yobiIds || []).length > 0) && (
-            <span style={{ fontSize: 9, color: C.muted, fontWeight: 700, alignSelf: "center" }}>呼び</span>
-          )}
+        {/* 女の子：左右を等幅カラムにして縦のラインを揃える */}
+        <div style={{ display: "grid", gridTemplateColumns: `repeat(${ses.girls.length}, 1fr)`, gap: 8 }}>
           {ses.girls.map((g, i) => {
-            const visited = ses.history.flatMap((t) => t.hostIds);
             const ys = (g.yobiIds || []).filter((id) => nameOf(id) !== "—");
             return (
-              <div key={i} style={{ display: "flex", alignItems: "center", gap: 4, minWidth: 0 }}>
-                <PosBadge pos={g.pos} small />
-                {g.name && <span style={{ color: C.cyan, fontSize: 10 }}>{g.name}</span>}
+              <div key={i} style={{ minWidth: 0 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                  <PosBadge pos={g.pos} small />
+                  {g.name && <span style={{ color: C.cyan, fontSize: 11, fontWeight: 700 }}>{g.name}</span>}
+                </div>
                 {ys.length > 0 && (
-                  <span style={{ color: posColor(g.pos || ""), fontSize: 9 }}>
-                    {ys.map((id, k) => (
-                      <span
-                        key={id}
-                        style={{
-                          textDecoration: visited.includes(id) ? "line-through" : "none",
-                          opacity: visited.includes(id) ? 0.55 : 1,
-                        }}
-                      >
-                        {k > 0 ? "・" : ""}{nameOf(id)}
-                      </span>
-                    ))}
-                  </span>
+                  <div style={{ display: "flex", alignItems: "center", gap: 4, marginTop: 2 }}>
+                    <span style={{ fontSize: 10, color: C.muted, fontWeight: 700 }}>呼び</span>
+                    <span style={{ color: posColor(g.pos || ""), fontSize: 12, fontWeight: 700 }}>
+                      {ys.map((id, k) => (
+                        <span
+                          key={id}
+                          style={{
+                            textDecoration: visited.includes(id) ? "line-through" : "none",
+                            opacity: visited.includes(id) ? 0.55 : 1,
+                          }}
+                        >
+                          {k > 0 ? "・" : ""}{nameOf(id)}
+                        </span>
+                      ))}
+                    </span>
+                  </div>
                 )}
               </div>
             );
           })}
         </div>
 
-        <div style={{ display: "flex", flexWrap: "wrap", gap: "2px 8px", alignItems: "baseline" }}>
-          <span style={{ color: C.muted, fontSize: 10, fontWeight: 700 }}>現在▸</span>
-          {ses.hostIds.length === 0 && (
-            <span style={{ fontSize: 12, fontWeight: 700, color: C.red }}>なし</span>
-          )}
-          {ses.hostIds.map((id) => {
-            const poses = tags[id];
-            return (
-              <span key={id} style={{ fontSize: 12, fontWeight: 700, color: poses ? posColor(poses[0]) : C.text }}>
-                {poses && <YobiMark poses={poses} />}{nameOf(id)}
-              </span>
-            );
-          })}
-        </div>
-
-        {((next && next.length > 0) || (next2 && next2.length > 0)) && (
-          <div style={{ borderTop: `1px solid ${C.line}`, paddingTop: 4, marginTop: 1 }}>
-            {next && next.length > 0 && (
-              <div style={{ fontSize: 13, fontWeight: 700 }}>
-                <span style={{ color: C.gold, fontSize: 11 }}>次▸ </span>
-                {next.map((id, k) => (
-                  <span key={id} style={{ color: C.goldBright }}>
-                    {k > 0 && "・"}{tags[id] && <YobiMark poses={tags[id]} />}{nameOf(id)}
-                  </span>
-                ))}
-              </div>
-            )}
-            {next2 && next2.length > 0 && (
-              <div style={{ fontSize: 11, fontWeight: 700, marginTop: 1 }}>
-                <span style={{ color: C.muted, fontSize: 10 }}>その次▸ </span>
-                {next2.map((id, k) => (
-                  <span key={id} style={{ color: `${C.goldBright}AA` }}>
-                    {k > 0 && "・"}{tags[id] && <YobiMark poses={tags[id]} />}{nameOf(id)}
-                  </span>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
+        {hostRow("現在▸", ses.hostIds)}
+        {next && next.length > 0 && hostRow("次▸", next)}
+        {next2 && next2.length > 0 && hostRow("その次▸", next2)}
 
         <div style={{ height: 3, background: C.surface2, borderRadius: 2, overflow: "hidden", marginTop: "auto" }}>
           <div
@@ -859,7 +827,8 @@ function TsukemawashiBoard() {
       <header
         style={{
           display: "flex", alignItems: "baseline", justifyContent: "space-between",
-          padding: "16px 16px 12px", borderBottom: `1px solid ${C.line}`,
+          padding: "calc(env(safe-area-inset-top, 0px) + 16px) 16px 12px",
+          borderBottom: `1px solid ${C.line}`,
           position: "sticky", top: 0, background: `${C.bg}F2`, backdropFilter: "blur(8px)", zIndex: 5,
         }}
       >
@@ -902,9 +871,9 @@ function TsukemawashiBoard() {
             </div>
           </section>
 
-          {/* 使用中の卓を上に */}
+          {/* 使用中の卓（横幅いっぱい・1列） */}
           {occupiedTables.length > 0 && (
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 8, marginBottom: 14 }}>
+            <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 16 }}>
               {occupiedTables.map(renderTableCard)}
             </div>
           )}
@@ -923,8 +892,45 @@ function TsukemawashiBoard() {
                   <span style={{ flex: 1, height: 1, background: C.line }} />
                 </div>
               )}
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 8 }}>
-                {emptyTables.map(renderTableCard)}
+              {/* アルファベットごとにまとめる */}
+              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                {(() => {
+                  const groups = [];
+                  emptyTables.forEach((t) => {
+                    const k = t[0];
+                    const g = groups.find((x) => x.k === k);
+                    if (g) g.items.push(t);
+                    else groups.push({ k, items: [t] });
+                  });
+                  return groups.map((g) => (
+                    <div key={g.k} style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                      <span
+                        style={{
+                          fontFamily: "Oswald, sans-serif", fontSize: 15, fontWeight: 600,
+                          color: C.gold, width: 16, flexShrink: 0, textAlign: "center",
+                        }}
+                      >
+                        {g.k}
+                      </span>
+                      <div style={{ display: "flex", flexWrap: "wrap", gap: 6, flex: 1 }}>
+                        {g.items.map((tid) => (
+                          <button
+                            key={tid}
+                            onClick={() => !readOnly && setModal({ type: "seat", tableId: tid })}
+                            style={{
+                              background: "transparent", border: `1px dashed ${C.line}`,
+                              borderRadius: 8, padding: "8px 14px", cursor: "pointer",
+                              color: C.muted, fontFamily: "Oswald, sans-serif",
+                              fontSize: 13, fontWeight: 600,
+                            }}
+                          >
+                            {tid}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  ));
+                })()}
               </div>
             </>
           )}
@@ -1829,11 +1835,11 @@ const DetailSheet = ({ tableId, ses, readOnly, clampMin, setTableRotateMin, host
       )}
       {!readOnly && (<>
       <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
-        <Btn kind="gold" onClick={onRotate} style={{ flex: 2 }}>回す（全員交代）</Btn>
+        <Btn kind="gold" onClick={onRotate} style={{ flex: 2 }}>次のキャストに回す</Btn>
         <Btn onClick={onPull} disabled={empty} style={{ flex: 1 }}>抜く</Btn>
       </div>
       <div style={{ display: "flex", gap: 8 }}>
-        <Btn kind="danger" onClick={onCheckout} style={{ width: "100%", flex: 1 }}>会計して卓を空ける</Btn>
+        <Btn kind="danger" onClick={onCheckout} style={{ width: "100%", flex: 1 }}>初回終了して送りを選択</Btn>
       </div>
 
       {/* 卓の取消（誤登録用） */}
