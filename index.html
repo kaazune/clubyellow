@@ -26,16 +26,15 @@
 const { useState, useEffect } = React;
 
 // ════════════════════════════════════════════════════
-// ▼▼▼ ここを自分のFirebase設定に置き換える（手順③で取得） ▼▼▼
+// Firebase設定（CLUB YELLOW）
 const firebaseConfig = {
   apiKey: "AIzaSyA0bM-E0ij5HQA2X_llS3ZOS0SH5kQ2Kt4",
   authDomain: "clubyellow-c2e1f.firebaseapp.com",
   databaseURL: "https://clubyellow-c2e1f-default-rtdb.asia-southeast1.firebasedatabase.app",
   projectId: "clubyellow-c2e1f",
 };
-// 操作用PIN（付け回し担当だけが知っている番号に変更する）
-const EDIT_PIN = "6666";
-// ▲▲▲ 設定はここまで ▲▲▲
+// 操作用PIN（変えたい時はここを書き換えて再アップロード）
+const EDIT_PIN = "0000";
 // ════════════════════════════════════════════════════
 
 firebase.initializeApp(firebaseConfig);
@@ -349,7 +348,6 @@ function TsukemawashiBoard() {
   const [newHostName, setNewHostName] = useState("");
   const [newTableName, setNewTableName] = useState("");
   const [confirmDeleteTable, setConfirmDeleteTable] = useState(null);
-  // 操作モード（PINで解除）。閲覧モードでは一切書き込まない
   const [editMode, setEditMode] = useState(localStorage.getItem("ty-edit") === "1");
   const readOnly = !editMode;
   const [pinInput, setPinInput] = useState("");
@@ -362,6 +360,7 @@ function TsukemawashiBoard() {
   };
   const lock = () => { setEditMode(false); localStorage.removeItem("ty-edit"); };
   const [confirmClear, setConfirmClear] = useState(false);
+  const [confirmDeleteLog, setConfirmDeleteLog] = useState(null);
   const [confirmDelete, setConfirmDelete] = useState(null);
   const [viewDay, setViewDay] = useState(bizDayStr(Date.now()));
   const [rankMode, setRankMode] = useState("day"); // "day" | "month"
@@ -411,7 +410,24 @@ function TsukemawashiBoard() {
   const today = bizDayStr(now);
   const dayOf = (e) => e.day || bizDayStr(e.endedAt);
   const todayEntries = log.filter((e) => dayOf(e) === today);
-  const todayStats = buildStats(todayEntries, Object.values(sessions), nameOf);
+  // 登録ホスト全員を0込みでランキングに載せる（同数はホスト登録順）
+  const withEveryone = (arr) => {
+    const m = {};
+    arr.forEach(([n, s]) => { m[n] = s; });
+    hosts.forEach((h) => { if (!m[h.name]) m[h.name] = { seated: 0, photo: 0, okuri: 0 }; });
+    const idx = (n) => {
+      const i = hosts.findIndex((h) => h.name === n);
+      return i < 0 ? 999 : i;
+    };
+    return Object.entries(m).sort(
+      (a, b) =>
+        b[1].seated - a[1].seated ||
+        b[1].okuri - a[1].okuri ||
+        b[1].photo - a[1].photo ||
+        idx(a[0]) - idx(b[0])
+    );
+  };
+  const todayStats = withEveryone(buildStats(todayEntries, Object.values(sessions), nameOf));
   const seatedCountOf = (h) => {
     const row = todayStats.find(([name]) => name === h.name);
     return row ? row[1].seated : 0;
@@ -465,6 +481,15 @@ function TsukemawashiBoard() {
     setTableIds((ts) => ts.filter((t) => t !== tid));
     setConfirmDeleteTable(null);
   };
+  const moveTable = (tid, dir) =>
+    setTableIds((ts) => {
+      const i = ts.indexOf(tid);
+      const j = i + dir;
+      if (i < 0 || j < 0 || j >= ts.length) return ts;
+      const n = [...ts];
+      [n[i], n[j]] = [n[j], n[i]];
+      return n;
+    });
 
   // ─── 卓操作 ───
   // 引き抜き：1人でも抜かれた卓は残りのホストも全員待機へ戻り、卓は無人になる
@@ -535,6 +560,22 @@ function TsukemawashiBoard() {
     setModal(null);
   };
 
+  // 取消：間違えて開けた卓を履歴に残さず消す。ホストは待機へ
+  const cancelTable = (tableId) => {
+    const ses = sessions[tableId];
+    if (!ses) return;
+    const t = Date.now();
+    setHosts((hs) =>
+      hs.map((h) => (ses.hostIds.includes(h.id) ? { ...h, status: "waiting", waitSince: t } : h))
+    );
+    setSessions((s) => {
+      const n = { ...s };
+      delete n[tableId];
+      return n;
+    });
+    setModal(null);
+  };
+
   // 抜く：ホスト全員を待機に戻して卓を無人にする（お客様は残る）
   const pullAll = (tableId) => {
     const ses = sessions[tableId];
@@ -560,6 +601,11 @@ function TsukemawashiBoard() {
       s[tableId] ? { ...s, [tableId]: { ...s[tableId], reserved } } : s
     );
     setModal({ type: "detail", tableId });
+  };
+
+  const removeLogEntry = (id) => {
+    setLog((l) => l.filter((e) => e.id !== id));
+    setConfirmDeleteLog(null);
   };
 
   const checkout = (tableId, okuriIds) => {
@@ -605,7 +651,7 @@ function TsukemawashiBoard() {
     rankMode === "day"
       ? viewDay === today ? Object.values(sessions) : []
       : today.startsWith(viewMonth) ? Object.values(sessions) : [];
-  const viewStats = buildStats(rankMode === "day" ? viewEntries : monthEntries, liveForView, nameOf);
+  const viewStats = withEveryone(buildStats(rankMode === "day" ? viewEntries : monthEntries, liveForView, nameOf));
 
   const occupiedTables = tableIds.filter((t) => sessions[t]);
 
@@ -924,7 +970,11 @@ function TsukemawashiBoard() {
                   <span style={{ textAlign: "center", color: C.pink }}>📸写真</span>
                   <span style={{ textAlign: "center", color: C.goldBright }}>送り</span>
                 </div>
-                {viewStats.map(([name, s], i) => (
+                {viewStats.map(([name, s], i) => {
+                  // 日間は休みのホストをグレーアウト（月間は全員そのまま）
+                  const hostRec = hosts.find((h) => h.name === name);
+                  const dimmed = rankMode === "day" && hostRec && !hostRec.active;
+                  return (
                   <div
                     key={name}
                     style={{
@@ -932,6 +982,7 @@ function TsukemawashiBoard() {
                       padding: "9px 12px",
                       borderBottom: i < viewStats.length - 1 ? `1px solid ${C.line}66` : "none",
                       fontSize: 13, fontWeight: 700, alignItems: "center",
+                      opacity: dimmed ? 0.4 : 1,
                     }}
                   >
                     <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
@@ -944,7 +995,8 @@ function TsukemawashiBoard() {
                     <span style={{ textAlign: "center", fontFamily: "Oswald, sans-serif", color: s.photo > 0 ? C.pink : C.muted }}>{s.photo}</span>
                     <span style={{ textAlign: "center", fontFamily: "Oswald, sans-serif", color: s.okuri > 0 ? C.goldBright : C.muted }}>{s.okuri}</span>
                   </div>
-                ))}
+                  );
+                })}
               </div>
             </section>
           )}
@@ -974,6 +1026,42 @@ function TsukemawashiBoard() {
                     <span style={{ fontFamily: "Oswald, sans-serif", fontSize: 13, color: C.muted }}>
                       {fmtTime(e.startedAt)}–{fmtTime(e.endedAt)}（{fmt(e.endedAt - e.startedAt)}・⟳{e.turns.length}）
                     </span>
+                    {!readOnly && (
+                    <span style={{ marginLeft: "auto", flexShrink: 0 }}>
+                      {confirmDeleteLog === e.id ? (
+                        <span style={{ display: "inline-flex", gap: 6 }}>
+                          <button
+                            onClick={() => removeLogEntry(e.id)}
+                            style={{
+                              background: `${C.red}1A`, border: `1px solid ${C.red}`, borderRadius: 6,
+                              color: C.red, fontSize: 11, fontWeight: 700, padding: "4px 8px", cursor: "pointer",
+                              fontFamily: "'Zen Kaku Gothic New', sans-serif",
+                            }}
+                          >
+                            削除
+                          </button>
+                          <button
+                            onClick={() => setConfirmDeleteLog(null)}
+                            style={{
+                              background: "none", border: `1px solid ${C.line}`, borderRadius: 6,
+                              color: C.muted, fontSize: 11, fontWeight: 700, padding: "4px 8px", cursor: "pointer",
+                              fontFamily: "'Zen Kaku Gothic New', sans-serif",
+                            }}
+                          >
+                            やめる
+                          </button>
+                        </span>
+                      ) : (
+                        <button
+                          onClick={() => setConfirmDeleteLog(e.id)}
+                          style={{ background: "none", border: "none", color: C.muted, fontSize: 14, cursor: "pointer" }}
+                          aria-label="この履歴を削除"
+                        >
+                          ✕
+                        </button>
+                      )}
+                    </span>
+                    )}
                   </div>
 
                   {e.girls.map((g, i) => (
@@ -1032,7 +1120,6 @@ function TsukemawashiBoard() {
       {/* ───────── 設定タブ ───────── */}
       {tab === "hosts" && (
         <main style={{ padding: 16 }}>
-          {/* 閲覧/操作モード */}
           <div style={{ border: `1px solid ${readOnly ? C.line : C.gold}66`, borderRadius: 10, padding: "12px", marginBottom: 20, background: C.surface }}>
             {readOnly ? (
               <>
@@ -1175,39 +1262,66 @@ function TsukemawashiBoard() {
           <div style={{ marginTop: 26, borderTop: `1px solid ${C.line}`, paddingTop: 16 }}>
             <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 4 }}>卓の管理</div>
             <div style={{ fontSize: 11, color: C.muted, marginBottom: 10 }}>
-              ✕を2回タップで削除（使用中の卓は削除できません）。追加した卓は一番下に並びます
+              ▲▼で並び替え。✕→「削除?」の2回タップで削除（使用中の卓は削除できません）
             </div>
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 8, marginBottom: 12 }}>
-              {tableIds.map((tid) => {
+            <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 12 }}>
+              {tableIds.map((tid, idx) => {
                 const inUse = !!sessions[tid];
                 const pending = confirmDeleteTable === tid;
                 return (
                   <div
                     key={tid}
                     style={{
-                      display: "flex", alignItems: "center", justifyContent: "space-between",
+                      display: "flex", alignItems: "center", gap: 8,
                       background: pending ? `${C.red}12` : C.surface,
                       border: `1px solid ${pending ? C.red : C.line}`,
-                      borderRadius: 8, padding: "8px 10px",
+                      borderRadius: 8, padding: "6px 10px",
                     }}
                   >
-                    <span style={{ fontFamily: "Oswald, sans-serif", fontSize: 14, fontWeight: 600 }}>{tid}</span>
-                    {inUse ? (
-                      <span style={{ fontSize: 9, color: C.goldBright }}>使用中</span>
-                    ) : (
+                    <div style={{ display: "flex", gap: 4 }}>
                       <button
-                        onClick={() => (pending ? removeTable(tid) : setConfirmDeleteTable(tid))}
+                        onClick={() => moveTable(tid, -1)}
+                        disabled={idx === 0}
                         style={{
-                          background: "none", border: "none",
-                          color: pending ? C.red : C.muted,
-                          fontSize: pending ? 11 : 14, fontWeight: 700, cursor: "pointer", padding: 0,
-                          fontFamily: "'Zen Kaku Gothic New', sans-serif",
+                          background: "none", border: `1px solid ${C.line}`, borderRadius: 5,
+                          color: idx === 0 ? `${C.muted}55` : C.muted,
+                          fontSize: 10, padding: "3px 8px", cursor: "pointer",
                         }}
-                        aria-label={pending ? `${tid}を削除（確認）` : `${tid}を削除`}
+                        aria-label="上へ"
                       >
-                        {pending ? "削除?" : "✕"}
+                        ▲
                       </button>
-                    )}
+                      <button
+                        onClick={() => moveTable(tid, 1)}
+                        disabled={idx === tableIds.length - 1}
+                        style={{
+                          background: "none", border: `1px solid ${C.line}`, borderRadius: 5,
+                          color: idx === tableIds.length - 1 ? `${C.muted}55` : C.muted,
+                          fontSize: 10, padding: "3px 8px", cursor: "pointer",
+                        }}
+                        aria-label="下へ"
+                      >
+                        ▼
+                      </button>
+                    </div>
+                    <span style={{ fontFamily: "Oswald, sans-serif", fontSize: 15, fontWeight: 600 }}>{tid}</span>
+                    <span style={{ marginLeft: "auto" }}>
+                      {inUse ? (
+                        <span style={{ fontSize: 10, color: C.goldBright }}>使用中</span>
+                      ) : (
+                        <button
+                          onClick={() => (pending ? removeTable(tid) : setConfirmDeleteTable(tid))}
+                          style={{
+                            background: "none", border: "none",
+                            color: pending ? C.red : C.muted,
+                            fontSize: pending ? 11 : 14, fontWeight: 700, cursor: "pointer", padding: 0,
+                            fontFamily: "'Zen Kaku Gothic New', sans-serif",
+                          }}
+                        >
+                          {pending ? "削除?" : "✕"}
+                        </button>
+                      )}
+                    </span>
                   </div>
                 );
               })}
@@ -1311,6 +1425,7 @@ function TsukemawashiBoard() {
               onRotate={() => setModal({ type: "rotate", tableId: modal.tableId })}
               onReserve={() => setModal({ type: "reserve", tableId: modal.tableId })}
               onPull={() => pullAll(modal.tableId)}
+              onCancel={() => cancelTable(modal.tableId)}
               onCheckout={() => setModal({ type: "checkout", tableId: modal.tableId })}
             />
           )}
@@ -1494,7 +1609,8 @@ const SeatForm = ({ tableId, defaultMins, clampMin, hosts, pickerHosts, seatMap,
 };
 
 // ─── 卓詳細シート ───────────────────────────────────
-const DetailSheet = ({ tableId, ses, readOnly, clampMin, setTableRotateMin, hostById, now, onRotate, onReserve, onPull, onCheckout }) => {
+const DetailSheet = ({ tableId, ses, readOnly, clampMin, setTableRotateMin, hostById, now, onRotate, onReserve, onPull, onCancel, onCheckout }) => {
+  const [confirmCancel, setConfirmCancel] = useState(false);
   const nameOf = (id) => hostById(id)?.name || "—";
   const limit = clampMin(ses.rotateMin) * 60 * 1000;
   const rotRem = limit - (now - ses.seatedAt);
@@ -1649,17 +1765,36 @@ const DetailSheet = ({ tableId, ses, readOnly, clampMin, setTableRotateMin, host
           誰も着いていません（無人 {fmt(now - (ses.emptySince || ses.seatedAt))}）— 「回す」で新しく付けられます
         </div>
       )}
-      {!readOnly && (
-        <>
-          <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
-            <Btn kind="gold" onClick={onRotate} style={{ flex: 2 }}>回す（全員交代）</Btn>
-            <Btn onClick={onPull} disabled={empty} style={{ flex: 1 }}>抜く</Btn>
-          </div>
+      {!readOnly && (<>
+      <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+        <Btn kind="gold" onClick={onRotate} style={{ flex: 2 }}>回す（全員交代）</Btn>
+        <Btn onClick={onPull} disabled={empty} style={{ flex: 1 }}>抜く</Btn>
+      </div>
+      <div style={{ display: "flex", gap: 8 }}>
+        <Btn kind="danger" onClick={onCheckout} style={{ width: "100%", flex: 1 }}>会計して卓を空ける</Btn>
+      </div>
+
+      {/* 卓の取消（誤登録用） */}
+      <div style={{ marginTop: 12 }}>
+        {confirmCancel ? (
           <div style={{ display: "flex", gap: 8 }}>
-            <Btn kind="danger" onClick={onCheckout} style={{ width: "100%", flex: 1 }}>会計して卓を空ける</Btn>
+            <Btn kind="danger" onClick={onCancel} style={{ flex: 2 }}>取消する（履歴に残りません）</Btn>
+            <Btn onClick={() => setConfirmCancel(false)} style={{ flex: 1 }}>やめる</Btn>
           </div>
-        </>
-      )}
+        ) : (
+          <button
+            onClick={() => setConfirmCancel(true)}
+            style={{
+              width: "100%", background: "none", border: "none", color: C.muted,
+              fontSize: 11, textDecoration: "underline", cursor: "pointer",
+              fontFamily: "'Zen Kaku Gothic New', sans-serif", padding: 4,
+            }}
+          >
+            この卓を取消（間違えて開けた時用・履歴に残さず消す）
+          </button>
+        )}
+      </div>
+      </>)}
     </div>
   );
 };
