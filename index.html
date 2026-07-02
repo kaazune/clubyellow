@@ -40,7 +40,7 @@ const EDIT_PIN = "0000";
 firebase.initializeApp(firebaseConfig);
 const BOARD_PATH = "boards/main";
 
-// Firebaseは空の配列を保存しないため、読み込み時に復元する
+// Firebaseは空配列を保存しないため読み込み時に復元
 const normalizeSessions = (s) => {
   const out = {};
   Object.entries(s || {}).forEach(([tid, se]) => {
@@ -50,7 +50,16 @@ const normalizeSessions = (s) => {
       reserved: (se.reserved || []).map((a) => a || []),
       girls: (se.girls || []).map((g) => ({ ...g, yobiIds: g.yobiIds || [] })),
       history: (se.history || []).map((t) => ({ ...t, hostIds: t.hostIds || [] })),
+      okuriDecided: se.okuriDecided || undefined,
     };
+  });
+  return out;
+};
+const normalizeShimei = (s) => {
+  const out = {};
+  Object.entries(s || {}).forEach(([tid, se]) => {
+    if (se.reserved) { out[tid] = { reserved: true, memo: se.memo || {} }; }
+    else { out[tid] = { seats: (se.seats || []).map((x) => ({ ...x })) }; }
   });
   return out;
 };
@@ -59,6 +68,7 @@ const normalizeLog = (l) =>
     ...e,
     turns: (e.turns || []).map((t) => ({ ...t, names: t.names || [] })),
     girls: (e.girls || []).map((g) => ({ ...g, yobiNames: g.yobiNames || [] })),
+    nomiNames: e.nomiNames || [],
   }));
 
 
@@ -73,6 +83,41 @@ const DEFAULT_TABLES = [
   "E1", "E3", "E5", "EL",
 ];
 const DEFAULT_MIN = 5;
+// 指名の席区分
+const KINDS = {
+  set:   { label: "セット", color: "#D8B45A", limitMin: null },     // 指名：着席時刻のみ
+  quick: { label: "クイック", color: "#5BC8DC", limitMin: 60 },     // 指名：60分
+  peer:  { label: "同業", color: "#B07CF0", limitMin: 60 },         // 指名：60分
+  nomi2: { label: "2万飲み直し", color: "#D8B45A", limitMin: null },// フリータイム＝着席時刻のみ
+  nomi1: { label: "1万飲み直し", color: "#5BC8DC", limitMin: 90 },  // 90分（23時制限なし）
+  taiten: { label: "体入", color: "#6FCF97", limitMin: null }, // 体験入店：カウントアップ
+};
+const QUICK_LAST_ORDER_H = 23;   // クイック提供は23時まで
+const QUICK_WARN_BEFORE_MS = 10 * 60 * 1000; // 10分前で赤
+
+// 席の時間状態を返す：{ text, alert }
+// セット＝着席時刻のみ。クイック/同業＝60分カウントダウン（50分で10分前赤）。
+// クイックは 22:50一斉赤 も加わり、90分…ではなく早い方の赤。
+const seatTimeState = (now) => (seat) => {
+  const k = KINDS[seat.kind] || KINDS.set;
+  if (seat.kind === "taiten") {
+    // 体入：カウントアップ
+    return { text: fmt(now - seat.startedAt), alert: false, countup: true };
+  }
+  if (!k.limitMin) {
+    // セット：着席時刻だけ
+    return { text: fmtTime(seat.startedAt), alert: false };
+  }
+  const rem = k.limitMin * 60 * 1000 - (now - seat.startedAt);
+  let alert = rem <= QUICK_WARN_BEFORE_MS; // 残り10分で赤
+  if (seat.kind === "quick") {
+    const closeWarn = todayAtHour(now, QUICK_LAST_ORDER_H) - QUICK_WARN_BEFORE_MS; // 22:50
+    if (now >= closeWarn) alert = true;
+  }
+  const mins = Math.ceil(rem / 60000);
+  const text = rem < 0 ? `${Math.ceil(-rem / 60000)}分超過` : `あと${mins}分`;
+  return { text, alert };
+};
 const SET_MS = 60 * 60 * 1000; // 初回セット1時間
 const DAY_CUTOFF_H = 8;        // 朝8時までは前日の営業日として扱う
 // 1分〜10分、30秒刻み
@@ -120,6 +165,12 @@ const dayLabel = (s) => {
   const [y, m, d] = s.split("-").map(Number);
   const dt = new Date(y, m - 1, d);
   return `${y}/${m}/${d}(${"日月火水木金土"[dt.getDay()]})`;
+};
+// 指定時刻(now基準)の当日23:00などのタイムスタンプ
+const todayAtHour = (now, h) => {
+  const d = new Date(now);
+  d.setHours(h, 0, 0, 0);
+  return d.getTime();
 };
 const shiftDay = (s, n) => {
   const [y, m, d] = s.split("-").map(Number);
@@ -318,7 +369,7 @@ const buildStats = (entries, liveSessions, nameOf) => {
   const m = {};
   const bump = (name, key) => {
     if (!name || name === "—") return;
-    if (!m[name]) m[name] = { seated: 0, photo: 0, okuri: 0 };
+    if (!m[name]) m[name] = { seated: 0, photo: 0, okuri: 0, nomi: 0 };
     m[name][key]++;
   };
   entries.forEach((e) => {
@@ -327,6 +378,7 @@ const buildStats = (entries, liveSessions, nameOf) => {
       g.yobiNames.forEach((n) => bump(n, "photo"));
       if (g.okuriName) bump(g.okuriName, "okuri");
     });
+    (e.nomiNames || []).forEach((n) => bump(n, "nomi"));
   });
   (liveSessions || []).forEach((ses) => {
     ses.history.forEach((turn) => turn.hostIds.forEach((id) => bump(nameOf(id), "seated")));
@@ -351,22 +403,20 @@ function TsukemawashiBoard() {
   const [newHostName, setNewHostName] = useState("");
   const [newTableName, setNewTableName] = useState("");
   const [confirmDeleteTable, setConfirmDeleteTable] = useState(null);
-  const [editMode, setEditMode] = useState(localStorage.getItem("ty-edit") === "1");
-  const readOnly = !editMode;
-  const [pinInput, setPinInput] = useState("");
-  const tryUnlock = () => {
-    if (pinInput === EDIT_PIN) {
-      setEditMode(true);
-      localStorage.setItem("ty-edit", "1");
-      setPinInput("");
-    }
-  };
-  const lock = () => { setEditMode(false); localStorage.removeItem("ty-edit"); };
   const [confirmClear, setConfirmClear] = useState(false);
   const [confirmDeleteLog, setConfirmDeleteLog] = useState(null);
   const [confirmDelete, setConfirmDelete] = useState(null);
   const [viewDay, setViewDay] = useState(bizDayStr(Date.now()));
   const [rankMode, setRankMode] = useState("day"); // "day" | "month"
+  // 指名卓：{ tableId: { pairs:[{hostId, himeName}], seatedAt } }
+  const [shimei, setShimei] = useState({});
+  const [editMode, setEditMode] = useState(localStorage.getItem("ty-edit") === "1");
+  const readOnly = !editMode;
+  const [pinInput, setPinInput] = useState("");
+  const tryUnlock = () => {
+    if (pinInput === EDIT_PIN) { setEditMode(true); localStorage.setItem("ty-edit", "1"); setPinInput(""); }
+  };
+  const lock = () => { setEditMode(false); localStorage.removeItem("ty-edit"); };
 
   useEffect(() => {
     const t = setInterval(() => setNow(Date.now()), 1000);
@@ -394,6 +444,7 @@ function TsukemawashiBoard() {
           remoteRef.current = JSON.stringify(d);
           setHosts((d.hosts || []).map((h) => ({ active: true, ...h })));
           setSessions(normalizeSessions(d.sessions || {}));
+          setShimei(normalizeShimei(d.shimei || {}));
           setTableIds(d.tableIds && d.tableIds.length ? d.tableIds : DEFAULT_TABLES);
           setDefaultMins({ 1: DEFAULT_MIN, 2: DEFAULT_MIN, 3: DEFAULT_MIN, ...(d.defaultMins || {}) });
           setLog(normalizeLog(d.log || []));
@@ -407,13 +458,13 @@ function TsukemawashiBoard() {
 
   useEffect(() => {
     if (!loaded || readOnly) return;
-    const data = { hosts, sessions, tableIds, defaultMins, log };
+    const data = { hosts, sessions, shimei, tableIds, defaultMins, log };
     const json = JSON.stringify(data);
     if (json === remoteRef.current) return;
     remoteRef.current = json;
     firebase.database().ref(BOARD_PATH).set(JSON.parse(json))
       .catch((e) => console.error("保存に失敗しました", e));
-  }, [hosts, sessions, tableIds, defaultMins, log, loaded, readOnly]);
+  }, [hosts, sessions, shimei, tableIds, defaultMins, log, loaded, readOnly]);
 
   const clampMin = (m) => Math.min(10, Math.max(1, m || DEFAULT_MIN));
   const hostById = (id) => hosts.find((h) => h.id === id);
@@ -482,6 +533,102 @@ function TsukemawashiBoard() {
       })
     );
 
+  // ─── 指名卓の操作 ───
+  // 指名の他卓引き抜き（初回・指名どちらからでも外す）
+  const detachEverywhere = (ids, t) => {
+    setSessions((s) => {
+      const out = {};
+      Object.entries(s).forEach(([tid, se]) => {
+        if (se.hostIds.some((id) => ids.includes(id))) {
+          const kept = se.hostIds.filter((id) => !ids.includes(id));
+          out[tid] = { ...se, hostIds: kept, ...(kept.length === 0 ? { emptySince: t } : {}) };
+        } else out[tid] = se;
+      });
+      return out;
+    });
+    setShimei((s) => {
+      const out = {};
+      Object.entries(s).forEach(([tid, se]) => {
+        if (se.reserved) { out[tid] = se; return; }
+        const kept = se.seats.filter((st) => !ids.includes(st.hostId));
+        if (kept.length !== se.seats.length) {
+          if (kept.length > 0) out[tid] = { ...se, seats: kept };
+          // 空になった指名卓は消す
+        } else out[tid] = se;
+      });
+      return out;
+    });
+  };
+
+  // 指名：担当を選んでも待機状態や他卓には一切影響させない（誰の卓かの記録だけ）
+  // 予約卓を作る（時間なし・担当/名前は任意）
+  const reserveShimei = (tableId, { hostId, name }) => {
+    setShimei((s) => ({ ...s, [tableId]: { reserved: true, memo: { hostId: hostId || null, name: (name || "").trim() } } }));
+    setModal(null);
+  };
+  const editReserve = (tableId, { hostId, name }) => {
+    setShimei((s) => (s[tableId] ? { ...s, [tableId]: { reserved: true, memo: { hostId: hostId || null, name: (name || "").trim() } } } : s));
+    setModal(null);
+  };
+  const cancelReserve = (tableId) => {
+    setShimei((s) => { const n = { ...s }; delete n[tableId]; return n; });
+    setModal(null);
+  };
+  // 予約→指名で着席に変換（予約を消して着席フォームへ）
+  const reserveToSeat = (tableId) => {
+    setModal({ type: "shimeiSeat", tableId, fromReserve: true });
+  };
+
+  const seatShimei = (tableId, seats) => {
+    const t = Date.now();
+    setShimei((s) => ({
+      ...s,
+      [tableId]: { seats: seats.map((x) => ({ ...x, startedAt: t })) },
+    }));
+    setModal(null);
+  };
+  const addShimeiSeats = (tableId, seats) => {
+    const t = Date.now();
+    setShimei((s) => ({
+      ...s,
+      [tableId]: { seats: [...(s[tableId]?.seats || []), ...seats.map((x) => ({ ...x, startedAt: t }))] },
+    }));
+    setModal({ type: "shimeiDetail", tableId });
+  };
+  // 席区分の変更（クイック→セット等）。セットにするとカウントアップ
+  const setSeatHime = (tableId, idx, himeName) =>
+    setShimei((s) => {
+      if (!s[tableId]) return s;
+      const seats = s[tableId].seats.map((st, i) => (i === idx ? { ...st, himeName } : st));
+      return { ...s, [tableId]: { ...s[tableId], seats } };
+    });
+  const setSeatKind = (tableId, idx, kind) =>
+    setShimei((s) => {
+      if (!s[tableId]) return s;
+      const seats = s[tableId].seats.map((st, i) =>
+        i === idx ? { ...st, kind, startedAt: Date.now() } : st
+      );
+      return { ...s, [tableId]: { ...s[tableId], seats } };
+    });
+  const moveShimei = (fromId, toId) => {
+    setShimei((s) => {
+      if (!s[fromId] || s[toId]) return s;
+      const n = { ...s };
+      n[toId] = n[fromId];       // 時間継続（各seatのstartedAtそのまま）
+      delete n[fromId];
+      return n;
+    });
+    setModal({ type: "shimeiDetail", tableId: toId });
+  };
+  const endShimei = (tableId) => {
+    setShimei((s) => {
+      const n = { ...s };
+      delete n[tableId];
+      return n;
+    });
+    setModal(null);
+  };
+
   // ─── 卓の追加・削除 ───
   const addTable = () => {
     const name = newTableName.trim().toUpperCase();
@@ -529,10 +676,11 @@ function TsukemawashiBoard() {
       ...out,
       [tableId]: {
         girls, hostIds,
-        history: [{ hostIds, at: t }],
+        history: hostIds.length > 0 ? [{ hostIds, at: t }] : [],
         seatedAt: t, startedAt: t,
         rotateMin: clampMin(rotateMin),
         reserved: [],
+        ...(hostIds.length === 0 ? { emptySince: t } : {}),
       },
     });
     setHosts((hs) =>
@@ -638,10 +786,10 @@ function TsukemawashiBoard() {
     setConfirmDeleteLog(null);
   };
 
-  const checkout = (tableId, okuriIds) => {
+  // 履歴に記録して初回卓を閉じる（共通処理）
+  const logAndCloseInitial = (tableId, okuriIds, t, nomiNames) => {
     const ses = sessions[tableId];
     if (!ses) return;
-    const t = Date.now();
     const entry = {
       id: uid(),
       tableId,
@@ -650,21 +798,56 @@ function TsukemawashiBoard() {
       endedAt: t,
       turns: ses.history.map((turn) => ({ names: turn.hostIds.map(nameOf), at: turn.at })),
       girls: ses.girls.map((g, i) => ({
-        pos: g.pos,
-        name: g.name,
+        pos: g.pos, name: g.name,
         yobiNames: (g.yobiIds || []).map(nameOf),
         okuriName: okuriIds[i] ? nameOf(okuriIds[i]) : null,
       })),
+      nomiNames: nomiNames || [],
     };
     setLog((l) => [entry, ...l]);
     setHosts((hs) =>
       hs.map((h) => (ses.hostIds.includes(h.id) ? { ...h, status: "waiting", waitSince: t } : h))
     );
+    setSessions((s) => { const n = { ...s }; delete n[tableId]; return n; });
+  };
+
+  // 送りだけ決める：カウントアップ開始（回転タイマーは止まる）
+  const decideOkuri = (tableId, okuriIds) => {
+    const t = Date.now();
+    setSessions((s) =>
+      s[tableId] ? { ...s, [tableId]: { ...s[tableId], okuriDecided: okuriIds, okuriSince: t } } : s
+    );
+    setModal(null);
+  };
+  // 送り取り消し（初回に戻す）
+  const undoOkuri = (tableId) => {
     setSessions((s) => {
-      const n = { ...s };
-      delete n[tableId];
-      return n;
+      if (!s[tableId]) return s;
+      const n = { ...s[tableId] };
+      delete n.okuriDecided; delete n.okuriSince;
+      // 回転タイマーは止めていた分を考慮せずリセット（シンプルに今から）
+      return { ...s, [tableId]: { ...n, seatedAt: Date.now() } };
     });
+  };
+  // 会計（送り決定後、初回卓を閉じる）
+  const checkout = (tableId) => {
+    const ses = sessions[tableId];
+    if (!ses) return;
+    logAndCloseInitial(tableId, ses.okuriDecided || ses.girls.map(() => null), Date.now());
+    setModal(null);
+  };
+
+  // 飲み直し（指名へ）：送りの子がそのまま担当。seats=[{hostId,himeName,kind}]
+  const nominaoshi = (fromTableId, toTableId, seats) => {
+    const ses = sessions[fromTableId];
+    if (!ses) return;
+    const t = Date.now();
+    logAndCloseInitial(fromTableId, ses.okuriDecided || ses.girls.map(() => null), t, seats.map((x) => nameOf(x.hostId)));
+    setShimei((s) => ({
+      ...s,
+      [toTableId]: { seats: seats.map((x) => ({ ...x, startedAt: t })) },
+    }));
+    setTab("shimei");
     setModal(null);
   };
 
@@ -683,6 +866,24 @@ function TsukemawashiBoard() {
       : today.startsWith(viewMonth) ? Object.values(sessions) : [];
   const viewStats = withEveryone(buildStats(rankMode === "day" ? viewEntries : monthEntries, liveForView, nameOf));
 
+  // そのホストが今ついている卓数（初回＋指名）
+  const hostTableCount = (hid) => {
+    let n = 0;
+    Object.values(sessions).forEach((se) => { if (se.hostIds.includes(hid)) n++; });
+    Object.values(shimei).forEach((se) => { if (!se.reserved && (se.seats||[]).some((s) => s.hostId === hid)) n++; });
+    return n;
+  };
+  const shimeiTables = tableIds.filter((t) => shimei[t]);
+  // タブのアラート判定
+  const boardAlert = Object.values(sessions).some((se) => {
+    const empty = se.hostIds.length === 0;
+    const over = (now - se.seatedAt) >= clampMin(se.rotateMin) * 60 * 1000;
+    return empty || over;
+  });
+  const shimeiAlert = (() => {
+    const st = seatTimeState(now);
+    return Object.values(shimei).some((se) => !se.reserved && (se.seats || []).some((x) => st(x).alert));
+  })();
   const occupiedTables = tableIds.filter((t) => sessions[t]);
 
   // どのホストがどの卓に着いているか
@@ -690,26 +891,26 @@ function TsukemawashiBoard() {
   Object.entries(sessions).forEach(([t, ses]) => ses.hostIds.forEach((id) => { seatMap[id] = t; }));
   // 選択チップ用：待機（優先順）→ 着席中（グレー表示）の順
   const pickerHosts = [...pickable, ...activeHosts.filter((h) => h.status === "seated")];
-  const emptyTables = tableIds.filter((t) => !sessions[t]);
+  const emptyTables = tableIds.filter((t) => !sessions[t] && !shimei[t]);
 
   // 卓カード描画（使用中のみ・横幅いっぱい）
   const renderTableCard = (tid) => {
     const ses = sessions[tid];
     if (!ses) return null;
+    const waitingOkuri = !!ses.okuriDecided;   // 送り決定済み＝カウントアップ中
     const limit = clampMin(ses.rotateMin) * 60 * 1000;
     const rotRem = limit - (now - ses.seatedAt);
-    const over = rotRem < 0;
+    const over = !waitingOkuri && rotRem < 0;
     const ratio = Math.min(1, (now - ses.seatedAt) / limit);
     const turn = ses.history.length;
     const setRem = SET_MS - (now - ses.startedAt);
     const tags = yobiTagsOf(ses.girls);
     const next = (ses.reserved || [])[0];
     const next2 = (ses.reserved || [])[1];
-    const empty = ses.hostIds.length === 0;
+    const empty = !waitingOkuri && ses.hostIds.length === 0;
     const alert = over || empty;
     const visited = ses.history.flatMap((t) => t.hostIds);
 
-    // 現在/次/その次：ラベルも名前も同じ大きさ・同じ色（呼びの左右マークだけ色付き）
     const hostRow = (label, ids) => (
       <div key={label} style={{ display: "flex", flexWrap: "wrap", gap: "2px 8px", alignItems: "baseline" }}>
         <span style={{ color: C.muted, fontSize: 12, fontWeight: 700, width: 54, flexShrink: 0 }}>{label}</span>
@@ -732,7 +933,7 @@ function TsukemawashiBoard() {
         style={{
           width: "100%",
           background: alert ? C.redBg : C.surface,
-          border: alert ? `2px solid ${C.red}` : `1px solid ${C.gold}55`,
+          border: alert ? `2px solid ${C.red}` : waitingOkuri ? `1px solid ${C.cyan}66` : `1px solid ${C.gold}55`,
           animation: alert ? "alertPulse 1.2s ease-in-out infinite" : "none",
           borderRadius: 10, padding: "12px 12px 10px",
           cursor: "pointer", textAlign: "left",
@@ -743,73 +944,91 @@ function TsukemawashiBoard() {
       >
         <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between" }}>
           <span style={{ display: "flex", alignItems: "baseline", gap: 8, minWidth: 0 }}>
-            <span style={{ fontFamily: "Oswald, sans-serif", fontSize: 19, fontWeight: 600, color: C.text }}>{tid}</span>
-            <span style={{ fontSize: 11, color: C.cyan, fontWeight: 700 }}>{ses.girls.length}名初回</span>
-            <span style={{ fontSize: 11, fontWeight: 700, color: setRem >= 0 ? C.cyan : C.red }}>
+            <span style={{ fontFamily: "Oswald, sans-serif", fontSize: 24, fontWeight: 600, color: C.text }}>{tid}</span>
+            <span style={{ fontSize: 11, color: C.cyan, fontWeight: 700 }}>初回{ses.girls.length}名</span>
+            <span style={{ fontSize: 13, fontWeight: 700, color: setRem >= 0 ? C.cyan : C.red }}>
               {setRem >= 0 ? `初回あと ${fmt(setRem)}` : `初回超過 ${fmt(-setRem)}`}
             </span>
+            {waitingOkuri && (
+              <span style={{ fontSize: 11, fontWeight: 700, color: C.cyan }}>送り</span>
+            )}
           </span>
           <span style={{ display: "flex", alignItems: "baseline", gap: 12, flexShrink: 0 }}>
-            <span style={{ fontSize: 16, color: C.muted, fontWeight: 700 }}>⟳{turn}</span>
+            {!waitingOkuri && <span style={{ fontSize: 16, color: C.muted, fontWeight: 700 }}>⟳{turn}</span>}
             <span
               style={{
-                fontFamily: "Oswald, sans-serif", fontSize: 22, fontWeight: 600,
-                color: over || empty ? C.red : C.goldBright,
+                fontFamily: "Oswald, sans-serif",
+                fontSize: 22, fontWeight: 600,
+                color: over || empty ? C.red : waitingOkuri ? C.cyan : C.goldBright,
               }}
             >
-              {empty
+              {waitingOkuri
+                ? fmt(now - ses.okuriSince)
+                : empty
                 ? `無人 ${fmt(now - (ses.emptySince || ses.seatedAt))}`
                 : over ? `+${fmt(-rotRem)}` : fmt(rotRem)}
             </span>
           </span>
         </div>
 
-        {/* 女の子：左右を等幅カラムにして縦のラインを揃える */}
-        <div style={{ display: "grid", gridTemplateColumns: `repeat(${ses.girls.length}, 1fr)`, gap: 8 }}>
-          {ses.girls.map((g, i) => {
-            const ys = (g.yobiIds || []).filter((id) => nameOf(id) !== "—");
-            return (
-              <div key={i} style={{ minWidth: 0 }}>
-                <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
-                  <PosBadge pos={g.pos} small />
-                  {g.name && <span style={{ color: C.cyan, fontSize: 11, fontWeight: 700 }}>{g.name}</span>}
-                </div>
-                {ys.length > 0 && (
+        {waitingOkuri ? (
+          // 送り決定後：左右ごとに「送り担当」を初回と同じ色分けで表示
+          <div style={{ display: "grid", gridTemplateColumns: `repeat(${ses.girls.length}, 1fr)`, gap: 8 }}>
+            {ses.girls.map((g, i) => {
+              const oid = ses.okuriDecided[i];
+              return (
+                <div key={i} style={{ minWidth: 0 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                    <PosBadge pos={g.pos} small />
+                  </div>
                   <div style={{ display: "flex", alignItems: "center", gap: 4, marginTop: 2 }}>
-                    <span style={{ fontSize: 10, color: C.muted, fontWeight: 700 }}>呼び</span>
+                    <span style={{ fontSize: 10, color: C.muted, fontWeight: 700 }}>送り</span>
                     <span style={{ color: posColor(g.pos || ""), fontSize: 12, fontWeight: 700 }}>
-                      {ys.map((id, k) => (
-                        <span
-                          key={id}
-                          style={{
-                            textDecoration: visited.includes(id) ? "line-through" : "none",
-                            opacity: visited.includes(id) ? 0.55 : 1,
-                          }}
-                        >
-                          {k > 0 ? "・" : ""}{nameOf(id)}
-                        </span>
-                      ))}
+                      {oid ? nameOf(oid) : "なし"}
                     </span>
                   </div>
-                )}
-              </div>
-            );
-          })}
-        </div>
+                </div>
+              );
+            })}
+          </div>
+        ) : (
+          <>
+            <div style={{ display: "grid", gridTemplateColumns: `repeat(${ses.girls.length}, 1fr)`, gap: 8 }}>
+              {ses.girls.map((g, i) => {
+                const ys = (g.yobiIds || []).filter((id) => nameOf(id) !== "—");
+                return (
+                  <div key={i} style={{ minWidth: 0 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                      <PosBadge pos={g.pos} small />
+                    </div>
+                    {ys.length > 0 && (
+                      <div style={{ display: "flex", alignItems: "center", gap: 4, marginTop: 2 }}>
+                        <span style={{ fontSize: 10, color: C.muted, fontWeight: 700 }}>呼び</span>
+                        <span style={{ color: posColor(g.pos || ""), fontSize: 12, fontWeight: 700 }}>
+                          {ys.map((id, k) => (
+                            <span key={id} style={{ textDecoration: visited.includes(id) ? "line-through" : "none", opacity: visited.includes(id) ? 0.55 : 1 }}>
+                              {k > 0 ? "・" : ""}{nameOf(id)}
+                            </span>
+                          ))}
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
 
-        {hostRow("現在▸", ses.hostIds)}
-        {next && next.length > 0 && hostRow("次▸", next)}
-        {next2 && next2.length > 0 && hostRow("その次▸", next2)}
+            {hostRow("現在▸", ses.hostIds)}
+            {next && next.length > 0 && hostRow("次▸", next)}
+            {next2 && next2.length > 0 && hostRow("その次▸", next2)}
+          </>
+        )}
 
-        <div style={{ height: 3, background: C.surface2, borderRadius: 2, overflow: "hidden", marginTop: "auto" }}>
-          <div
-            style={{
-              height: "100%", width: `${ratio * 100}%`,
-              background: alert ? C.red : `linear-gradient(90deg, ${C.gold}, ${C.goldBright})`,
-              transition: "width 1s linear",
-            }}
-          />
-        </div>
+        {!waitingOkuri && (
+          <div style={{ height: 3, background: C.surface2, borderRadius: 2, overflow: "hidden", marginTop: "auto" }}>
+            <div style={{ height: "100%", width: `${ratio * 100}%`, background: alert ? C.red : `linear-gradient(90deg, ${C.gold}, ${C.goldBright})`, transition: "width 1s linear" }} />
+          </div>
+        )}
       </button>
     );
   };
@@ -830,6 +1049,9 @@ function TsukemawashiBoard() {
           0%, 100% { box-shadow: 0 0 8px #E0484F55; }
           50% { box-shadow: 0 0 26px #E0484FCC; }
         }
+        @keyframes blink { 50% { opacity: 0.15; } }
+        @keyframes barBlink { 0%,100% { background: #E0484F; } 50% { background: #B02832; } }
+        @keyframes barBlink { 0%,100% { background: #E0484F; } 50% { background: #B02832; } }
         @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
       `}</style>
 
@@ -853,6 +1075,21 @@ function TsukemawashiBoard() {
           {hh}:{mi}
         </div>
       </header>
+
+      {((boardAlert && tab !== "board") || (shimeiAlert && tab !== "shimei")) && (
+        <button
+          onClick={() => setTab(boardAlert && tab !== "board" ? "board" : "shimei")}
+          style={{
+            position: "sticky", top: 0, zIndex: 6, width: "100%", border: "none", cursor: "pointer",
+            background: C.red, color: "#fff", fontWeight: 700, fontSize: 13,
+            padding: "10px 16px", fontFamily: "'Zen Kaku Gothic New', sans-serif",
+            display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
+            animation: "barBlink 1s ease-in-out infinite",
+          }}
+        >
+          ⚠ {[boardAlert ? "初回" : null, shimeiAlert ? "指名" : null].filter(Boolean).join("・")}でアラートがあります ― タップで確認
+        </button>
+      )}
 
       {/* ───────── 卓ボード ───────── */}
       {tab === "board" && (
@@ -959,6 +1196,143 @@ function TsukemawashiBoard() {
         </main>
       )}
 
+      {/* ───────── 指名タブ ───────── */}
+      {tab === "shimei" && (
+        <main style={{ padding: 12, maxWidth: 1280, margin: "0 auto", width: "100%" }}>
+          {shimeiTables.length > 0 && (
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: `repeat(${boardCols}, 1fr)`,
+                gap: 10, marginBottom: 16, alignItems: "start",
+              }}
+            >
+              {shimeiTables.map((tid) => {
+                const ses = shimei[tid];
+                const st = seatTimeState(now);
+                // 予約卓
+                if (ses.reserved) {
+                  return (
+                    <button
+                      key={tid}
+                      onClick={() => setModal({ type: "reserveDetail", tableId: tid })}
+                      style={{
+                        width: "100%", background: C.surface,
+                        border: `1px dashed ${C.gold}77`,
+                        borderRadius: 10, padding: "12px", cursor: "pointer", textAlign: "left",
+                        display: "flex", flexDirection: "column", gap: 6,
+                        fontFamily: "'Zen Kaku Gothic New', sans-serif",
+                      }}
+                    >
+                      <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between" }}>
+                        <span style={{ fontFamily: "Oswald, sans-serif", fontSize: 19, fontWeight: 600, color: C.text }}>{tid}</span>
+                        <span style={{ fontSize: 11, color: C.gold, fontWeight: 700, border: `1px solid ${C.gold}66`, borderRadius: 4, padding: "1px 8px" }}>予約</span>
+                      </div>
+                      <div style={{ fontSize: 13, fontWeight: 700, color: C.muted }}>
+                        {ses.memo?.name ? <span style={{ color: C.pink }}>♦ {ses.memo.name} 様　</span> : null}
+                        {ses.memo?.hostId ? <span style={{ color: C.goldBright }}>担当 {nameOf(ses.memo.hostId)}</span> : null}
+                        {!ses.memo?.name && !ses.memo?.hostId ? "（詳細未設定）" : null}
+                      </div>
+                    </button>
+                  );
+                }
+                const anyAlert = ses.seats.some((se) => st(se).alert);
+                return (
+                  <button
+                    key={tid}
+                    onClick={() => setModal({ type: "shimeiDetail", tableId: tid })}
+                    style={{
+                      width: "100%", background: anyAlert ? C.redBg : C.surface,
+                      border: anyAlert ? `2px solid ${C.red}` : `1px solid ${C.pink}55`,
+                      animation: anyAlert ? "alertPulse 1.2s ease-in-out infinite" : "none",
+                      borderRadius: 10, padding: "12px 12px 10px", cursor: "pointer", textAlign: "left",
+                      display: "flex", flexDirection: "column", gap: 7,
+                      fontFamily: "'Zen Kaku Gothic New', sans-serif",
+                    }}
+                  >
+                    <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between" }}>
+                      <span style={{ fontFamily: "Oswald, sans-serif", fontSize: 19, fontWeight: 600, color: C.text }}>{tid}</span>
+                      <span style={{ fontSize: 11, color: ses.seats.every((s)=>s.kind==="taiten") ? KINDS.taiten.color : C.pink, fontWeight: 700 }}>
+                        {ses.seats.every((s)=>s.kind==="taiten") ? "体入" : `指名 ${ses.seats.length}名`}
+                      </span>
+                    </div>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                      {ses.seats.map((se, i) => {
+                        const info = st(se);
+                        const k = KINDS[se.kind] || KINDS.set;
+                        return (
+                          <div key={i} style={{ display: "flex", alignItems: "baseline", gap: 6, fontSize: 13, fontWeight: 700 }}>
+                            <span style={{ color: k.color, fontSize: 10, border: `1px solid ${k.color}66`, borderRadius: 4, padding: "0 5px" }}>{k.label}</span>
+                            {se.kind !== "taiten" && <span style={{ color: C.goldBright }}>{nameOf(se.hostId)}</span>}
+                            {se.himeName && <span style={{ color: C.pink, fontSize: 12 }}>♦ {se.himeName} 様</span>}
+                            <span style={{ marginLeft: "auto", display: "flex", alignItems: "baseline", gap: 6 }}>
+                              <span style={{ fontFamily: "Oswald, sans-serif", fontSize: 10, color: C.muted }}>{fmtTime(se.startedAt)}〜</span>
+                              <span style={{ fontFamily: "'Zen Kaku Gothic New', sans-serif", fontSize: 14, fontWeight: 700, color: info.alert ? C.red : (info.countup || (KINDS[se.kind]||KINDS.set).limitMin) ? C.goldBright : C.muted }}>
+                                {(info.countup || (KINDS[se.kind]||KINDS.set).limitMin) ? info.text : ""}
+                              </span>
+                            </span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+
+          {/* 空き卓（指名を入れられる卓）*/}
+          {(() => {
+            const freeForShimei = tableIds.filter((t) => !sessions[t] && !shimei[t]);
+            if (freeForShimei.length === 0) return null;
+            if (readOnly) return null;
+            const groups = [];
+            freeForShimei.forEach((t) => {
+              const k = t[0];
+              const g = groups.find((x) => x.k === k);
+              if (g) g.items.push(t); else groups.push({ k, items: [t] });
+            });
+            return (
+              <>
+                {shimeiTables.length > 0 && (
+                  <div style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 10, color: C.muted, letterSpacing: "0.2em", marginBottom: 8 }}>
+                    <span style={{ flex: 1, height: 1, background: C.line }} />空き卓に指名・体入・予約を入れる<span style={{ flex: 1, height: 1, background: C.line }} />
+                  </div>
+                )}
+                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                  {groups.map((g) => (
+                    <div key={g.k} style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                      <span style={{ fontFamily: "Oswald, sans-serif", fontSize: 15, fontWeight: 600, color: C.pink, width: 16, flexShrink: 0, textAlign: "center" }}>{g.k}</span>
+                      <div style={{ display: "flex", flexWrap: "wrap", gap: 6, flex: 1 }}>
+                        {g.items.map((tid) => (
+                          <button
+                            key={tid}
+                            onClick={() => setModal({ type: "shimeiSeat", tableId: tid })}
+                            style={{
+                              background: "transparent", border: `1px dashed ${C.line}`,
+                              borderRadius: 8, padding: "8px 16px", cursor: "pointer",
+                              color: C.muted, fontFamily: "Oswald, sans-serif", fontSize: 13, fontWeight: 600,
+                            }}
+                          >
+                            {tid}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </>
+            );
+          })()}
+
+          {shimeiTables.length === 0 && (
+            <div style={{ color: C.muted, fontSize: 13, textAlign: "center", padding: "20px 0", lineHeight: 1.8 }}>
+              指名卓はまだありません。{readOnly ? "" : "上の空き卓から指名を入れられます。"}
+            </div>
+          )}
+        </main>
+      )}
+
       {/* ───────── 履歴タブ ───────── */}
       {tab === "log" && (
         <main style={{ padding: 16, maxWidth: 760, margin: "0 auto", width: "100%" }}>
@@ -1031,15 +1405,16 @@ function TsukemawashiBoard() {
               <div style={{ background: C.surface, border: `1px solid ${C.line}`, borderRadius: 10, overflow: "hidden" }}>
                 <div
                   style={{
-                    display: "grid", gridTemplateColumns: "1fr 60px 60px 60px",
-                    padding: "8px 12px", borderBottom: `1px solid ${C.line}`,
-                    fontSize: 10, color: C.muted, letterSpacing: "0.1em",
+                    display: "grid", gridTemplateColumns: "1fr 48px 48px 48px 48px",
+                    padding: "8px 10px", borderBottom: `1px solid ${C.line}`,
+                    fontSize: 10, color: C.muted, letterSpacing: "0.06em",
                   }}
                 >
-                  <span>ホスト{rankMode === "day" && viewDay === today ? "（着席中も含む）" : ""}</span>
-                  <span style={{ textAlign: "center" }}>着いた数</span>
-                  <span style={{ textAlign: "center", color: C.pink }}>📸写真</span>
+                  <span>ホスト{rankMode === "day" && viewDay === today ? "（着席中含む）" : ""}</span>
+                  <span style={{ textAlign: "center" }}>着</span>
+                  <span style={{ textAlign: "center", color: C.pink }}>写真</span>
                   <span style={{ textAlign: "center", color: C.goldBright }}>送り</span>
+                  <span style={{ textAlign: "center", color: C.cyan }}>飲直</span>
                 </div>
                 {viewStats.map(([name, s], i) => {
                   // 日間は休みのホストをグレーアウト（月間は全員そのまま）
@@ -1049,15 +1424,15 @@ function TsukemawashiBoard() {
                   <div
                     key={name}
                     style={{
-                      display: "grid", gridTemplateColumns: "1fr 60px 60px 60px",
-                      padding: "9px 12px",
+                      display: "grid", gridTemplateColumns: "1fr 48px 48px 48px 48px",
+                      padding: "9px 10px",
                       borderBottom: i < viewStats.length - 1 ? `1px solid ${C.line}66` : "none",
                       fontSize: 13, fontWeight: 700, alignItems: "center",
                       opacity: dimmed ? 0.4 : 1,
                     }}
                   >
                     <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                      <span style={{ color: i === 0 ? C.goldBright : C.muted, fontFamily: "Oswald, sans-serif", fontSize: 11, marginRight: 8 }}>
+                      <span style={{ color: i === 0 ? C.goldBright : C.muted, fontFamily: "Oswald, sans-serif", fontSize: 11, marginRight: 6 }}>
                         {i + 1}
                       </span>
                       {name}
@@ -1065,6 +1440,7 @@ function TsukemawashiBoard() {
                     <span style={{ textAlign: "center", fontFamily: "Oswald, sans-serif" }}>{s.seated}</span>
                     <span style={{ textAlign: "center", fontFamily: "Oswald, sans-serif", color: s.photo > 0 ? C.pink : C.muted }}>{s.photo}</span>
                     <span style={{ textAlign: "center", fontFamily: "Oswald, sans-serif", color: s.okuri > 0 ? C.goldBright : C.muted }}>{s.okuri}</span>
+                    <span style={{ textAlign: "center", fontFamily: "Oswald, sans-serif", color: (s.nomi||0) > 0 ? C.cyan : C.muted }}>{s.nomi || 0}</span>
                   </div>
                   );
                 })}
@@ -1097,8 +1473,7 @@ function TsukemawashiBoard() {
                     <span style={{ fontFamily: "Oswald, sans-serif", fontSize: 13, color: C.muted }}>
                       {fmtTime(e.startedAt)}–{fmtTime(e.endedAt)}（{fmt(e.endedAt - e.startedAt)}・⟳{e.turns.length}）
                     </span>
-                    {!readOnly && (
-                    <span style={{ marginLeft: "auto", flexShrink: 0 }}>
+                    {!readOnly && (<span style={{ marginLeft: "auto", flexShrink: 0 }}>
                       {confirmDeleteLog === e.id ? (
                         <span style={{ display: "inline-flex", gap: 6 }}>
                           <button
@@ -1131,8 +1506,7 @@ function TsukemawashiBoard() {
                           ✕
                         </button>
                       )}
-                    </span>
-                    )}
+                    </span>)}
                   </div>
 
                   {e.girls.map((g, i) => (
@@ -1169,7 +1543,7 @@ function TsukemawashiBoard() {
             </div>
           )}
 
-          {!readOnly && log.length > 0 && (
+          {log.length > 0 && (
             <div style={{ marginTop: 20 }}>
               {confirmClear ? (
                 <div style={{ display: "flex", gap: 8 }}>
@@ -1196,20 +1570,10 @@ function TsukemawashiBoard() {
               <>
                 <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 8 }}>閲覧モード（見るだけ・操作不可）</div>
                 <div style={{ display: "flex", gap: 8 }}>
-                  <input
-                    type="password"
-                    inputMode="numeric"
-                    value={pinInput}
-                    onChange={(e) => setPinInput(e.target.value)}
-                    onKeyDown={(e) => e.key === "Enter" && tryUnlock()}
-                    placeholder="操作用PINを入力"
-                    style={{ ...inputStyle, flex: 1 }}
-                  />
+                  <input type="password" inputMode="numeric" value={pinInput} onChange={(e) => setPinInput(e.target.value)} onKeyDown={(e) => e.key === "Enter" && tryUnlock()} placeholder="操作用PINを入力" style={{ ...inputStyle, flex: 1 }} />
                   <Btn kind="gold" onClick={tryUnlock}>解除</Btn>
                 </div>
-                {pinInput.length >= EDIT_PIN.length && pinInput !== EDIT_PIN && (
-                  <div style={{ fontSize: 11, color: C.red, marginTop: 6 }}>PINが違います</div>
-                )}
+                {pinInput.length >= EDIT_PIN.length && pinInput !== EDIT_PIN && (<div style={{ fontSize: 11, color: C.red, marginTop: 6 }}>PINが違います</div>)}
               </>
             ) : (
               <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
@@ -1459,7 +1823,8 @@ function TsukemawashiBoard() {
         }}
       >
         {[
-          { id: "board", label: "卓", sub: `${occupiedCount}/${tableIds.length}` },
+          { id: "board", label: "初回", sub: `${occupiedCount}卓` },
+          { id: "shimei", label: "指名", sub: `${shimeiTables.length}卓` },
           { id: "log", label: "履歴", sub: `${todayEntries.length}件` },
           { id: "hosts", label: "設定", sub: `${activeHosts.length}名出勤` },
         ].map((t) => (
@@ -1473,7 +1838,10 @@ function TsukemawashiBoard() {
               fontFamily: "'Zen Kaku Gothic New', sans-serif",
             }}
           >
-            <div style={{ fontSize: 15, fontWeight: 700 }}>{t.label}</div>
+            <div style={{ fontSize: 15, fontWeight: 700, position: "relative", display: "inline-block" }}>
+              {t.label}
+
+            </div>
             <div style={{ fontSize: 10, letterSpacing: "0.1em" }}>{t.sub}</div>
           </button>
         ))}
@@ -1505,7 +1873,10 @@ function TsukemawashiBoard() {
               onReserve={() => setModal({ type: "reserve", tableId: modal.tableId })}
               onPull={() => pullAll(modal.tableId)}
               onCancel={() => cancelTable(modal.tableId)}
-              onCheckout={() => setModal({ type: "checkout", tableId: modal.tableId })}
+              onSelectOkuri={() => setModal({ type: "okuri", tableId: modal.tableId })}
+              onUndoOkuri={() => { undoOkuri(modal.tableId); }}
+              onPay={() => checkout(modal.tableId)}
+              onNominaoshi={() => setModal({ type: "nominaoshi", tableId: modal.tableId })}
             />
           )}
           {modal.type === "rotate" && sessions[modal.tableId] && (
@@ -1528,13 +1899,87 @@ function TsukemawashiBoard() {
               onSubmit={(reserved) => setReserved(modal.tableId, reserved)}
             />
           )}
-          {modal.type === "checkout" && sessions[modal.tableId] && (
-            <CheckoutForm
+          {modal.type === "shimeiSeat" && (
+            <ShimeiSeatForm
+              tableId={modal.tableId}
+              prefill={modal.fromReserve && shimei[modal.tableId]?.reserved ? shimei[modal.tableId].memo : null}
+              hosts={activeHosts}
+              pickerHosts={pickerHosts}
+              seatMap={seatMap}
+              hostById={hostById}
+              onSubmit={(seats) => seatShimei(modal.tableId, seats)}
+              onReserve={(memo) => reserveShimei(modal.tableId, memo)}
+            />
+          )}
+          {modal.type === "reserveForm" && (
+            <ShimeiReserveForm
+              tableId={modal.tableId}
+              hosts={activeHosts}
+              hostById={hostById}
+              initial={shimei[modal.tableId]?.reserved ? shimei[modal.tableId].memo : null}
+              onSubmit={(memo) => reserveShimei(modal.tableId, memo)}
+            />
+          )}
+          {modal.type === "reserveDetail" && shimei[modal.tableId]?.reserved && (
+            <ShimeiReserveDetail
+              tableId={modal.tableId}
+              memo={shimei[modal.tableId].memo}
+              hostById={hostById}
+              readOnly={readOnly}
+              onEdit={() => setModal({ type: "reserveForm", tableId: modal.tableId })}
+              onSeat={() => reserveToSeat(modal.tableId)}
+              onCancel={() => cancelReserve(modal.tableId)}
+            />
+          )}
+          {modal.type === "shimeiAdd" && shimei[modal.tableId] && (
+            <ShimeiSeatForm
+              tableId={modal.tableId}
+              title="に組を追加"
+              existingCount={shimei[modal.tableId].seats.length}
+              hosts={activeHosts}
+              pickerHosts={pickerHosts}
+              seatMap={seatMap}
+              hostById={hostById}
+              onSubmit={(seats) => addShimeiSeats(modal.tableId, seats)}
+            />
+          )}
+          {modal.type === "shimeiDetail" && shimei[modal.tableId] && !shimei[modal.tableId].reserved && (
+            <ShimeiDetail
+              tableId={modal.tableId}
+              ses={shimei[modal.tableId]}
+              hostById={hostById}
+              now={now}
+              readOnly={readOnly}
+              onMove={() => setModal({ type: "shimeiMove", tableId: modal.tableId })}
+              onAdd={() => setModal({ type: "shimeiAdd", tableId: modal.tableId })}
+              onChangeKind={(idx, kind) => setSeatKind(modal.tableId, idx, kind)}
+              onEditHime={(idx, himeName) => setSeatHime(modal.tableId, idx, himeName)}
+              onEnd={() => endShimei(modal.tableId)}
+            />
+          )}
+          {modal.type === "shimeiMove" && shimei[modal.tableId] && (
+            <ShimeiMoveForm
+              tableId={modal.tableId}
+              freeTables={tableIds.filter((t) => !sessions[t] && !shimei[t])}
+              onSubmit={(toId) => moveShimei(modal.tableId, toId)}
+            />
+          )}
+          {modal.type === "okuri" && sessions[modal.tableId] && (
+            <OkuriForm
               tableId={modal.tableId}
               ses={sessions[modal.tableId]}
               hosts={hosts}
               hostById={hostById}
-              onSubmit={(okuriIds) => checkout(modal.tableId, okuriIds)}
+              onSubmit={(okuriIds) => decideOkuri(modal.tableId, okuriIds)}
+            />
+          )}
+          {modal.type === "nominaoshi" && sessions[modal.tableId] && sessions[modal.tableId].okuriDecided && (
+            <NominaoshiForm
+              tableId={modal.tableId}
+              ses={sessions[modal.tableId]}
+              hostById={hostById}
+              freeTables={tableIds.filter((t) => t !== modal.tableId && !sessions[t] && !shimei[t])}
+              onSubmit={(toId, seats) => nominaoshi(modal.tableId, toId, seats)}
             />
           )}
         </Sheet>
@@ -1576,7 +2021,7 @@ const SeatForm = ({ tableId, defaultMins, clampMin, hosts, pickerHosts, seatMap,
 
   const tags = yobiTagsOf(girls);
   const conflicts = yobiConflicts(hostIds, girls);
-  const ready = hostIds.length === size;
+  const ready = hostIds.length === 0 || hostIds.length === size;
 
   return (
     <div>
@@ -1601,7 +2046,7 @@ const SeatForm = ({ tableId, defaultMins, clampMin, hosts, pickerHosts, seatMap,
                 border: `1px solid ${size === n ? C.cyan : C.line}`,
               }}
             >
-              {n}名初回
+              初回{n}名
             </button>
           ))}
         </div>
@@ -1620,15 +2065,6 @@ const SeatForm = ({ tableId, defaultMins, clampMin, hosts, pickerHosts, seatMap,
             <span style={{ fontSize: 13, fontWeight: 700 }}>{g.pos ? `${g.pos}の女の子` : "お客様"}</span>
           </div>
 
-          <Field label="名前（任意）">
-            <input
-              value={g.name}
-              onChange={(e) => updateGirl(i, { name: e.target.value })}
-              placeholder="例：ゆき"
-              style={inputStyle}
-            />
-          </Field>
-
           <Field
             label={`呼び・写真指名（なし〜2人）${g.yobiIds.length > 0 ? ` — ${g.yobiIds.length}人` : ""}`}
             style={{ marginBottom: 0 }}
@@ -1645,7 +2081,7 @@ const SeatForm = ({ tableId, defaultMins, clampMin, hosts, pickerHosts, seatMap,
         </div>
       ))}
 
-      <Field label={`付けるホスト（${hostIds.length}/${size}人を同時に選択）— 卓名付きは他卓から引き抜き（元の卓は全員待機に戻り無人表示）`}>
+      <Field label={`付けるホスト（${hostIds.length}/${size}人・後から付けてもOK）— 卓名付きは他卓から連れてくる`}>
         <HostChips
           list={pickerHosts}
           selected={hostIds}
@@ -1655,6 +2091,9 @@ const SeatForm = ({ tableId, defaultMins, clampMin, hosts, pickerHosts, seatMap,
           disabledIds={conflicts}
           notes={seatMap}
         />
+        <div style={{ fontSize: 11, color: C.muted, marginTop: 6 }}>
+          呼び（写真指名）だけ先に決めて、ホストは空欄のまま着席もできます。その場合は卓が無人アラートになり、あとで「次のキャストに回す」で付けられます。
+        </div>
       </Field>
 
       <Field label="この卓の回転時間">
@@ -1674,22 +2113,23 @@ const SeatForm = ({ tableId, defaultMins, clampMin, hosts, pickerHosts, seatMap,
         disabled={!ready}
         onClick={() =>
           onSubmit({
-            girls: girls.map((g) => ({ ...g, name: g.name.trim() })),
+            girls: girls.map((g) => ({ ...g, name: "" })),
             hostIds,
             rotateMin,
           })
         }
         style={{ width: "100%", padding: 14, fontSize: 15 }}
       >
-        着席（{hostIds.length}/{size}人付ける）
+        {hostIds.length === 0 ? "呼びのみで着席（あとでホストを付ける）" : `着席（${hostIds.length}/${size}人付ける）`}
       </Btn>
     </div>
   );
 };
 
 // ─── 卓詳細シート ───────────────────────────────────
-const DetailSheet = ({ tableId, ses, readOnly, clampMin, setTableRotateMin, hostById, now, onRotate, onReserve, onPull, onCancel, onCheckout }) => {
+const DetailSheet = ({ tableId, ses, readOnly, clampMin, setTableRotateMin, hostById, now, onRotate, onReserve, onPull, onCancel, onSelectOkuri, onUndoOkuri, onPay, onNominaoshi }) => {
   const [confirmCancel, setConfirmCancel] = useState(false);
+  const okuriDecided = !!ses.okuriDecided;
   const nameOf = (id) => hostById(id)?.name || "—";
   const limit = clampMin(ses.rotateMin) * 60 * 1000;
   const rotRem = limit - (now - ses.seatedAt);
@@ -1707,11 +2147,13 @@ const DetailSheet = ({ tableId, ses, readOnly, clampMin, setTableRotateMin, host
           <span style={{ fontFamily: "Oswald, sans-serif", fontSize: 26, fontWeight: 600, color: C.goldBright }}>
             {tableId}
           </span>
-          <span style={{ fontSize: 13, color: C.cyan, fontWeight: 700 }}>{ses.girls.length}名初回</span>
-          <span style={{ fontSize: 13, color: C.muted, fontWeight: 700 }}>⟳{turn}ターン目</span>
+          <span style={{ fontSize: 13, color: C.cyan, fontWeight: 700 }}>初回{ses.girls.length}名</span>
+          {!okuriDecided && <span style={{ fontSize: 13, color: C.muted, fontWeight: 700 }}>⟳{turn}ターン目</span>}
         </div>
-        <span style={{ fontFamily: "Oswald, sans-serif", fontSize: 28, fontWeight: 500, color: over || empty ? C.red : C.goldBright }}>
-          {empty
+        <span style={{ fontFamily: "Oswald, sans-serif", fontSize: 28, fontWeight: 500, color: over || empty ? C.red : okuriDecided ? C.cyan : C.goldBright }}>
+          {okuriDecided
+            ? `送り ${fmt(now - ses.okuriSince)}`
+            : empty
             ? `無人 ${fmt(now - (ses.emptySince || ses.seatedAt))}`
             : over ? `+${fmt(-rotRem)}` : fmt(rotRem)}
         </span>
@@ -1720,18 +2162,37 @@ const DetailSheet = ({ tableId, ses, readOnly, clampMin, setTableRotateMin, host
         <span style={{ color: C.muted, fontFamily: "Oswald, sans-serif" }}>
           着席開始 {fmtTime(ses.startedAt)}
         </span>
-        <span style={{ fontWeight: 700, color: setRem >= 0 ? C.cyan : C.red }}>
+        <span style={{ fontSize: 15, fontWeight: 700, color: setRem >= 0 ? C.cyan : C.red }}>
           {setRem >= 0 ? `初回あと ${fmt(setRem)}` : `初回超過 ${fmt(-setRem)}`}
         </span>
       </div>
 
-      {ses.girls.map((g, i) => {
+      {okuriDecided && (
+        <div style={{ display: "grid", gridTemplateColumns: `repeat(${ses.girls.length}, 1fr)`, gap: 10, marginBottom: 4 }}>
+          {ses.girls.map((g, i) => {
+            const oid = ses.okuriDecided[i];
+            return (
+              <div key={i} style={{ border: `1px solid ${C.line}`, borderRadius: 10, padding: "10px 12px", background: `${C.surface2}66` }}>
+                <PosBadge pos={g.pos} small />
+                <div style={{ display: "flex", alignItems: "baseline", gap: 5, marginTop: 6 }}>
+                  <span style={{ fontSize: 10, color: C.muted, fontWeight: 700 }}>送り</span>
+                  <span style={{ fontSize: 15, fontWeight: 700, color: oid ? posColor(g.pos || "") : C.muted }}>
+                    {oid ? nameOf(oid) : "なし"}
+                  </span>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {!okuriDecided && ses.girls.map((g, i) => {
         const visited = ses.history.flatMap((t) => t.hostIds);
         const ys = (g.yobiIds || []).filter((id) => nameOf(id) !== "—");
         return (
           <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6, flexWrap: "wrap" }}>
             <PosBadge pos={g.pos} />
-            <span style={{ fontSize: 14, fontWeight: 700, color: C.cyan }}>{g.name || "お客様"}</span>
+            <span style={{ fontSize: 14, fontWeight: 700, color: C.cyan }}>{g.name ? `${g.name} 様` : "お客様"}</span>
             {ys.length > 0 && (
               <span style={{ fontSize: 12, color: posColor(g.pos || ""), fontWeight: 700 }}>
                 <span style={{ fontSize: 10, color: C.muted, marginRight: 3 }}>呼び</span>
@@ -1753,6 +2214,7 @@ const DetailSheet = ({ tableId, ses, readOnly, clampMin, setTableRotateMin, host
         );
       })}
 
+      {!okuriDecided && (<>
       <div style={{ fontSize: 11, color: C.muted, letterSpacing: "0.12em", margin: "12px 0 7px" }}>着席中のホスト</div>
       <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
         {ses.hostIds.map((id) => {
@@ -1829,42 +2291,53 @@ const DetailSheet = ({ tableId, ses, readOnly, clampMin, setTableRotateMin, host
           </span>
         ))}
       </div>
+      </>)}
 
-      {!readOnly && (
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", margin: "14px 0 16px" }}>
-        <span style={{ fontSize: 13, fontWeight: 700 }}>この卓の回転時間</span>
-        <select
-          value={clampMin(ses.rotateMin)}
-          onChange={(e) => setTableRotateMin(tableId, Number(e.target.value))}
-          style={selectStyle}
-        >
-          {MIN_OPTIONS.map((m) => (
-            <option key={m} value={m}>{fmtMin(m)}</option>
-          ))}
-        </select>
-      </div>
-      )}
+      {okuriDecided ? (
+        !readOnly && (<>
+          <div style={{ textAlign: "right", marginBottom: 12 }}>
+            <button onClick={onUndoOkuri} style={{ background: "none", border: "none", color: C.muted, fontSize: 11, textDecoration: "underline", cursor: "pointer", fontFamily: "'Zen Kaku Gothic New', sans-serif" }}>
+              送りをやり直す（初回に戻す）
+            </button>
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            <Btn kind="danger" onClick={onPay} style={{ width: "100%", padding: 14, fontSize: 15 }}>会計して卓を空ける</Btn>
+            <Btn kind="gold" disabled={ses.okuriDecided.filter(Boolean).length === 0} onClick={onNominaoshi} style={{ width: "100%", padding: 14, fontSize: 15 }}>飲み直し（指名へ切替）</Btn>
+            {ses.okuriDecided.filter(Boolean).length === 0 && (
+              <div style={{ fontSize: 11, color: C.muted, textAlign: "center" }}>飲み直しには送り指名が必要です</div>
+            )}
+          </div>
+        </>)
+      ) : (
+        <>
+          {!readOnly && (
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", margin: "14px 0 16px" }}>
+            <span style={{ fontSize: 13, fontWeight: 700 }}>この卓の回転時間</span>
+            <select value={clampMin(ses.rotateMin)} onChange={(e) => setTableRotateMin(tableId, Number(e.target.value))} style={selectStyle}>
+              {MIN_OPTIONS.map((m) => (<option key={m} value={m}>{fmtMin(m)}</option>))}
+            </select>
+          </div>
+          )}
 
-      {empty && (
-        <div
-          style={{
-            border: `1px solid ${C.red}66`, background: `${C.red}12`, borderRadius: 8,
-            padding: "8px 12px", marginBottom: 10, fontSize: 12, fontWeight: 700, color: C.red,
-          }}
-        >
-          誰も着いていません（無人 {fmt(now - (ses.emptySince || ses.seatedAt))}）— 「回す」で新しく付けられます
-        </div>
+          {empty && (
+            <div style={{ border: `1px solid ${C.red}66`, background: `${C.red}12`, borderRadius: 8, padding: "8px 12px", marginBottom: 10, fontSize: 12, fontWeight: 700, color: C.red }}>
+              誰も着いていません（無人 {fmt(now - (ses.emptySince || ses.seatedAt))}）— 「回す」で新しく付けられます
+            </div>
+          )}
+          {!readOnly && (<>
+          <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+            <Btn kind="gold" onClick={onRotate} style={{ flex: 2 }}>次のキャストに回す</Btn>
+            <Btn onClick={onPull} disabled={empty} style={{ flex: 1 }}>抜く</Btn>
+          </div>
+          <div style={{ display: "flex", gap: 8 }}>
+            <Btn kind="danger" onClick={onSelectOkuri} style={{ width: "100%", flex: 1 }}>送りを選択</Btn>
+          </div>
+          </>)}
+        </>
       )}
-      {!readOnly && (<>
-      <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
-        <Btn kind="gold" onClick={onRotate} style={{ flex: 2 }}>次のキャストに回す</Btn>
-        <Btn onClick={onPull} disabled={empty} style={{ flex: 1 }}>抜く</Btn>
-      </div>
-      <div style={{ display: "flex", gap: 8 }}>
-        <Btn kind="danger" onClick={onCheckout} style={{ width: "100%", flex: 1 }}>初回終了して送りを選択</Btn>
-      </div>
 
       {/* 卓の取消（誤登録用） */}
+      {!readOnly && (
       <div style={{ marginTop: 12 }}>
         {confirmCancel ? (
           <div style={{ display: "flex", gap: 8 }}>
@@ -1884,7 +2357,7 @@ const DetailSheet = ({ tableId, ses, readOnly, clampMin, setTableRotateMin, host
           </button>
         )}
       </div>
-      </>)}
+      )}
     </div>
   );
 };
@@ -2093,60 +2566,454 @@ const RotateForm = ({ tableId, ses, pickerHosts, seatMap, hostById, onSubmit }) 
 };
 
 // ─── 会計フォーム ───────────────────────────────────
-const CheckoutForm = ({ tableId, ses, hosts, hostById, onSubmit }) => {
-  const [okuri, setOkuri] = useState(ses.girls.map(() => null));
+// 区分セレクタ（allowで対象を限定）
+const KindPicker = ({ value, onChange, allow }) => (
+  <div style={{ display: "flex", gap: 8 }}>
+    {Object.entries(KINDS).filter(([id]) => !allow || allow.includes(id)).map(([id, k]) => (
+      <button
+        key={id}
+        onClick={() => onChange(id)}
+        style={{
+          flex: 1, padding: "10px 0", borderRadius: 8, fontSize: 13, fontWeight: 700,
+          fontFamily: "'Zen Kaku Gothic New', sans-serif", cursor: "pointer",
+          background: value === id ? `${k.color}22` : "transparent",
+          color: value === id ? k.color : C.muted,
+          border: `1px solid ${value === id ? k.color : C.line}`,
+        }}
+      >
+        {k.label}
+        {k.limitMin && <span style={{ fontSize: 9, display: "block", opacity: 0.8 }}>{k.limitMin}分</span>}
+      </button>
+    ))}
+  </div>
+);
+
+// ─── 予約：作成・編集フォーム（担当・名前は任意） ─
+const ShimeiReserveForm = ({ tableId, hosts, hostById, initial, onSubmit }) => {
+  const [name, setName] = useState(initial?.name || "");
+  const [hostId, setHostId] = useState(initial?.hostId || null);
+  return (
+    <div>
+      <div style={{ display: "flex", alignItems: "baseline", gap: 10, marginBottom: 6 }}>
+        <span style={{ fontFamily: "Oswald, sans-serif", fontSize: 26, fontWeight: 600, color: C.goldBright }}>{tableId}</span>
+        <span style={{ fontSize: 14, fontWeight: 700 }}>{initial ? "の予約を編集" : "を予約"}</span>
+      </div>
+      <div style={{ fontSize: 12, color: C.muted, marginBottom: 14 }}>
+        お客様名と担当は任意です（空欄でも予約できます）。時間は表示されません。
+      </div>
+      <Field label="お客様名（任意）">
+        <input value={name} onChange={(e) => setName(e.target.value)} placeholder="登録名" style={inputStyle} />
+      </Field>
+      <Field label="担当ホスト（任意・1人）">
+        <HostChips list={hosts} selected={hostId ? [hostId] : []} onToggle={(id) => setHostId(hostId === id ? null : id)} max={1} />
+      </Field>
+      <Btn kind="gold" onClick={() => onSubmit({ hostId, name })} style={{ width: "100%", padding: 14, fontSize: 15 }}>
+        {initial ? "保存" : "予約を入れる"}
+      </Btn>
+    </div>
+  );
+};
+
+// ─── 予約：詳細（来店→着席に変換 / 編集 / 取消） ─
+const ShimeiReserveDetail = ({ tableId, memo, hostById, readOnly, onEdit, onSeat, onCancel }) => {
+  const nameOf = (id) => hostById(id)?.name || "—";
+  const [confirmCancel, setConfirmCancel] = useState(false);
+  return (
+    <div>
+      <div style={{ display: "flex", alignItems: "baseline", gap: 10, marginBottom: 12 }}>
+        <span style={{ fontFamily: "Oswald, sans-serif", fontSize: 26, fontWeight: 600, color: C.goldBright }}>{tableId}</span>
+        <span style={{ fontSize: 13, color: C.gold, fontWeight: 700, border: `1px solid ${C.gold}66`, borderRadius: 4, padding: "1px 8px" }}>予約</span>
+      </div>
+      <div style={{ border: `1px solid ${C.line}`, borderRadius: 10, padding: "12px", background: `${C.surface2}66`, marginBottom: 16, fontSize: 14, fontWeight: 700 }}>
+        <div style={{ marginBottom: 6 }}>
+          <span style={{ color: C.muted, fontSize: 11 }}>お客様　</span>
+          {memo?.name ? <span style={{ color: C.pink }}>{memo.name} 様</span> : <span style={{ color: C.muted }}>未設定</span>}
+        </div>
+        <div>
+          <span style={{ color: C.muted, fontSize: 11 }}>担当　</span>
+          {memo?.hostId ? <span style={{ color: C.goldBright }}>{nameOf(memo.hostId)}</span> : <span style={{ color: C.muted }}>未設定</span>}
+        </div>
+      </div>
+      {!readOnly && (
+        <>
+          <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+            <Btn kind="gold" onClick={onSeat} style={{ flex: 2 }}>来店（指名で着席に変換）</Btn>
+            <Btn onClick={onEdit} style={{ flex: 1 }}>編集</Btn>
+          </div>
+          <div style={{ display: "flex", gap: 8 }}>
+            {confirmCancel ? (
+              <>
+                <Btn kind="danger" onClick={onCancel} style={{ flex: 2 }}>予約を取消</Btn>
+                <Btn onClick={() => setConfirmCancel(false)} style={{ flex: 1 }}>やめる</Btn>
+              </>
+            ) : (
+              <Btn kind="danger" onClick={() => setConfirmCancel(true)} style={{ width: "100%", flex: 1 }}>予約を取消</Btn>
+            )}
+          </div>
+        </>
+      )}
+    </div>
+  );
+};
+
+// ─── 指名：着席フォーム（担当＋姫＋区分。最大4組・グレーアウトなし） ─
+const ShimeiSeatForm = ({ tableId, title, existingCount, prefill, hosts, pickerHosts, seatMap, hostById, onSubmit, onReserve }) => {
+  const nameOf = (id) => hostById(id)?.name || "—";
+  const [rows, setRows] = useState([{ hostId: prefill?.hostId || null, himeName: prefill?.name || "", kind: "set" }]);
+  const [taiten, setTaiten] = useState(false);
+  const max = 4 - (existingCount || 0);
+
+  const setRow = (i, patch) => setRows((rs) => rs.map((r, j) => (j === i ? { ...r, ...patch } : r)));
+  const addRow = () => rows.length < max && setRows((rs) => [...rs, { hostId: null, himeName: "", kind: "set" }]);
+  const removeRow = (i) => setRows((rs) => rs.filter((_, j) => j !== i));
+
+  const chosen = rows.map((r) => r.hostId).filter(Boolean);
+  const ready = taiten || (rows.every((r) => r.hostId) && new Set(chosen).size === chosen.length);
+  const submit = () => {
+    if (taiten) {
+      onSubmit([{ hostId: null, himeName: "", kind: "taiten" }]);
+    } else {
+      onSubmit(rows.map((r) => ({ ...r, himeName: r.himeName.trim() })));
+    }
+  };
+
+  return (
+    <div>
+      <div style={{ display: "flex", alignItems: "baseline", gap: 10, marginBottom: 6 }}>
+        <span style={{ fontFamily: "Oswald, sans-serif", fontSize: 26, fontWeight: 600, color: C.goldBright }}>{tableId}</span>
+        <span style={{ fontSize: 14, fontWeight: 700 }}>{title || "に指名で着席"}</span>
+      </div>
+      <div style={{ fontSize: 12, color: C.muted, marginBottom: 14 }}>
+        担当ホストと姫、区分を組ごとに設定します（最大4組）。体験入店の場合は下のトグルをON。
+      </div>
+
+      {/* 体入トグル */}
+      {!title && (
+        <button
+          onClick={() => setTaiten((v) => !v)}
+          style={{
+            width: "100%", marginBottom: 14, borderRadius: 10, cursor: "pointer",
+            padding: "12px", fontFamily: "'Zen Kaku Gothic New', sans-serif",
+            fontSize: 13, fontWeight: 700,
+            background: taiten ? `${KINDS.taiten.color}22` : "transparent",
+            color: taiten ? KINDS.taiten.color : C.muted,
+            border: `1px solid ${taiten ? KINDS.taiten.color : C.line}`,
+            display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
+          }}
+        >
+          <span style={{
+            width: 16, height: 16, borderRadius: 4, flexShrink: 0,
+            border: `2px solid ${taiten ? KINDS.taiten.color : C.muted}`,
+            background: taiten ? KINDS.taiten.color : "transparent",
+            display: "inline-flex", alignItems: "center", justifyContent: "center",
+            color: "#0B0A12", fontSize: 11,
+          }}>{taiten ? "✓" : ""}</span>
+          体験入店で卓を使う（担当・区分なし・時間はカウントアップ）
+        </button>
+      )}
+
+      <div style={{ opacity: taiten ? 0.35 : 1, pointerEvents: taiten ? "none" : "auto" }}>
+      {rows.map((r, i) => (
+        <div key={i} style={{ border: `1px solid ${C.line}`, borderRadius: 10, padding: "12px", marginBottom: 10, background: `${C.surface2}66` }}>
+          <div style={{ display: "flex", alignItems: "center", marginBottom: 10 }}>
+            <span style={{ fontSize: 13, fontWeight: 700, color: C.pink }}>{i + 1}組目</span>
+            {rows.length > 1 && (
+              <button onClick={() => removeRow(i)} style={{ marginLeft: "auto", background: "none", border: "none", color: C.muted, fontSize: 12, cursor: "pointer", textDecoration: "underline", fontFamily: "'Zen Kaku Gothic New', sans-serif" }}>削除</button>
+            )}
+          </div>
+
+          <Field label="区分">
+            <KindPicker value={r.kind} onChange={(k) => setRow(i, { kind: k })} allow={["set","quick","peer"]} />
+          </Field>
+
+          <Field label="姫の名前（任意）">
+            <input value={r.himeName} onChange={(e) => setRow(i, { himeName: e.target.value })} placeholder="登録名" style={inputStyle} />
+          </Field>
+
+          <Field label="担当ホスト（1人）" style={{ marginBottom: 0 }}>
+            <HostChips
+              list={hosts}
+              selected={r.hostId ? [r.hostId] : []}
+              onToggle={(id) => setRow(i, { hostId: r.hostId === id ? null : id })}
+              max={1}
+            />
+          </Field>
+        </div>
+      ))}
+
+      {rows.length < max && (
+        <Btn onClick={addRow} style={{ width: "100%", marginBottom: 12 }}>＋ 組を追加</Btn>
+      )}
+      </div>
+
+      {title ? (
+        <Btn kind="gold" disabled={!ready} onClick={submit} style={{ width: "100%", padding: 14, fontSize: 15 }}>
+          追加する（{chosen.length}組）
+        </Btn>
+      ) : taiten ? (
+        <Btn kind="gold" onClick={submit} style={{ width: "100%", padding: 14, fontSize: 15 }}>
+          体入で卓を使う
+        </Btn>
+      ) : (
+        <div style={{ display: "flex", gap: 8 }}>
+          <Btn kind="gold" disabled={!ready} onClick={submit} style={{ flex: 2, padding: 14, fontSize: 15 }}>
+            指名で着席（{chosen.length}組）
+          </Btn>
+          <Btn onClick={() => onReserve({ hostId: rows[0]?.hostId || null, name: (rows[0]?.himeName || "").trim() })} style={{ flex: 1, padding: 14, fontSize: 14 }}>
+            予約にする
+          </Btn>
+        </div>
+      )}
+    </div>
+  );
+};
+
+// ─── 指名：卓詳細 ───
+const ShimeiDetail = ({ tableId, ses, hostById, now, readOnly, onMove, onAdd, onChangeKind, onEditHime, onEnd }) => {
+  const nameOf = (id) => hostById(id)?.name || "—";
+  const [confirmEnd, setConfirmEnd] = useState(false);
+  const [kindEdit, setKindEdit] = useState(null);
+  const [himeEdit, setHimeEdit] = useState(null);
+  const [himeVal, setHimeVal] = useState("");
+  const st = seatTimeState(now);
+  const isTaiten = ses.seats.every((s) => s.kind === "taiten");
+
+  return (
+    <div>
+      <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 14 }}>
+        <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
+          <span style={{ fontFamily: "Oswald, sans-serif", fontSize: 26, fontWeight: 600, color: C.goldBright }}>{tableId}</span>
+          <span style={{ fontSize: 13, color: isTaiten ? KINDS.taiten.color : C.pink, fontWeight: 700 }}>
+            {isTaiten ? "体験入店" : `指名 ${ses.seats.length}名`}
+          </span>
+        </div>
+      </div>
+
+      <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 16 }}>
+        {ses.seats.map((se, i) => {
+          const info = st(se);
+          const k = KINDS[se.kind] || KINDS.set;
+          return (
+            <div key={i} style={{ border: `1px solid ${info.alert ? C.red : C.line}`, borderRadius: 10, padding: "10px 12px", background: `${C.surface2}66` }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span style={{ color: k.color, fontSize: 11, fontWeight: 700, border: `1px solid ${k.color}66`, borderRadius: 4, padding: "1px 7px" }}>{k.label}</span>
+                {se.kind === "taiten" ? (
+                  <span style={{ fontSize: 14, fontWeight: 700, color: KINDS.taiten.color }}>体験入店</span>
+                ) : (<>
+                <span style={{ fontSize: 15, fontWeight: 700, color: C.goldBright }}>{nameOf(se.hostId)}</span>
+                {readOnly ? (
+                  se.himeName && <span style={{ fontSize: 13, fontWeight: 700, color: C.pink }}>♦ {se.himeName} 様</span>
+                ) : himeEdit === i ? (
+                  <span style={{ display: "inline-flex", gap: 4, alignItems: "center" }}>
+                    <input
+                      value={himeVal}
+                      onChange={(e) => setHimeVal(e.target.value)}
+                      placeholder="登録名"
+                      style={{ ...inputStyle, width: 90, padding: "4px 8px" }}
+                      autoFocus
+                    />
+                    <button onClick={() => { onEditHime(i, himeVal.trim()); setHimeEdit(null); }} style={{ background: `${C.gold}22`, border: `1px solid ${C.gold}`, borderRadius: 6, color: C.goldBright, fontSize: 11, fontWeight: 700, padding: "4px 8px", cursor: "pointer" }}>保存</button>
+                  </span>
+                ) : (
+                  <button onClick={() => { setHimeEdit(i); setHimeVal(se.himeName || ""); }} style={{ background: "none", border: "none", cursor: "pointer", padding: 0, fontSize: 13, fontWeight: 700, color: se.himeName ? C.pink : C.muted, fontFamily: "'Zen Kaku Gothic New', sans-serif" }}>
+                    {se.himeName ? `♦ ${se.himeName} 様` : "♦ お客様名を入力"}
+                  </button>
+                )}
+                </>)}
+                <span style={{ marginLeft: "auto", display: "flex", alignItems: "baseline", gap: 6 }}>
+                  <span style={{ fontFamily: "Oswald, sans-serif", fontSize: 11, color: C.muted }}>{fmtTime(se.startedAt)}〜</span>
+                  {(info.countup || k.limitMin) && <span style={{ fontSize: 15, fontWeight: 700, color: info.alert ? C.red : C.goldBright }}>{info.text}</span>}
+                </span>
+              </div>
+              {!readOnly && se.kind !== "taiten" && (
+                <div style={{ marginTop: 8 }}>
+                  {kindEdit === i ? (
+                    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                      <KindPicker
+                        value={se.kind}
+                        onChange={(nk) => { onChangeKind(i, nk); setKindEdit(null); }}
+                        allow={(se.kind === "nomi1" || se.kind === "nomi2") ? ["nomi2","nomi1"] : ["set","quick","peer"]}
+                      />
+                      <button onClick={() => setKindEdit(null)} style={{ background: "none", border: "none", color: C.muted, fontSize: 11, cursor: "pointer", textDecoration: "underline", fontFamily: "'Zen Kaku Gothic New', sans-serif" }}>閉じる</button>
+                    </div>
+                  ) : (
+                    <button onClick={() => setKindEdit(i)} style={{ background: "none", border: `1px solid ${C.line}`, borderRadius: 6, color: C.muted, fontSize: 11, fontWeight: 700, padding: "4px 10px", cursor: "pointer", fontFamily: "'Zen Kaku Gothic New', sans-serif" }}>区分を変更</button>
+                  )}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      {!readOnly && (
+        <>
+          {!isTaiten && (
+            <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+              <Btn kind="gold" onClick={onMove} style={{ flex: 1 }}>卓を移動</Btn>
+              {ses.seats.length < 4 && <Btn onClick={onAdd} style={{ flex: 1 }}>組を追加</Btn>}
+            </div>
+          )}
+          <div style={{ display: "flex", gap: 8 }}>
+            {confirmEnd ? (
+              <>
+                <Btn kind="danger" onClick={onEnd} style={{ flex: 2 }}>{isTaiten ? "終了する" : "会計する"}</Btn>
+                <Btn onClick={() => setConfirmEnd(false)} style={{ flex: 1 }}>やめる</Btn>
+              </>
+            ) : (
+              <Btn kind="danger" onClick={() => setConfirmEnd(true)} style={{ width: "100%", flex: 1 }}>{isTaiten ? "体入終了" : "会計"}</Btn>
+            )}
+          </div>
+        </>
+      )}
+    </div>
+  );
+};
+
+// ─── 指名：卓移動（時間は継続） ───
+const ShimeiMoveForm = ({ tableId, freeTables, onSubmit }) => {
+  const groups = [];
+  freeTables.forEach((t) => {
+    const k = t[0];
+    const g = groups.find((x) => x.k === k);
+    if (g) g.items.push(t); else groups.push({ k, items: [t] });
+  });
+  return (
+    <div>
+      <div style={{ display: "flex", alignItems: "baseline", gap: 10, marginBottom: 6 }}>
+        <span style={{ fontFamily: "Oswald, sans-serif", fontSize: 26, fontWeight: 600, color: C.goldBright }}>{tableId}</span>
+        <span style={{ fontSize: 14, fontWeight: 700 }}>から移動</span>
+      </div>
+      <div style={{ fontSize: 12, color: C.muted, marginBottom: 14 }}>移動先の空き卓を選んでください（時間はそのまま引き継がれます）。</div>
+      {freeTables.length === 0 ? (
+        <div style={{ color: C.muted, fontSize: 13, textAlign: "center", padding: "20px 0" }}>空き卓がありません</div>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {groups.map((g) => (
+            <div key={g.k} style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <span style={{ fontFamily: "Oswald, sans-serif", fontSize: 15, fontWeight: 600, color: C.gold, width: 16, textAlign: "center" }}>{g.k}</span>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 6, flex: 1 }}>
+                {g.items.map((t) => (
+                  <button key={t} onClick={() => onSubmit(t)} style={{ background: `${C.gold}12`, border: `1px solid ${C.gold}66`, borderRadius: 8, padding: "10px 16px", cursor: "pointer", color: C.goldBright, fontFamily: "Oswald, sans-serif", fontSize: 14, fontWeight: 600 }}>{t}</button>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
+// ─── 送り選択フォーム（送りだけ決める） ───
+const OkuriForm = ({ tableId, ses, hosts, hostById, onSubmit }) => {
+  const [okuri, setOkuri] = useState(ses.okuriDecided || ses.girls.map(() => null));
   const nameOf = (id) => hostById(id)?.name || "—";
   const visitedIds = [...new Set(ses.history.flatMap((t) => t.hostIds))];
-
   const pick = (i, id) => setOkuri((p) => p.map((v, j) => (j === i ? (v === id ? null : id) : v)));
 
   return (
     <div>
       <div style={{ display: "flex", alignItems: "baseline", gap: 10, marginBottom: 12 }}>
-        <span style={{ fontFamily: "Oswald, sans-serif", fontSize: 26, fontWeight: 600, color: C.goldBright }}>
-          {tableId}
-        </span>
-        <span style={{ fontSize: 14, fontWeight: 700 }}>を会計</span>
+        <span style={{ fontFamily: "Oswald, sans-serif", fontSize: 26, fontWeight: 600, color: C.goldBright }}>{tableId}</span>
+        <span style={{ fontSize: 14, fontWeight: 700 }}>の送りを選択</span>
       </div>
-
       <div style={{ fontSize: 12, color: C.muted, marginBottom: 14 }}>
-        女の子ごとに送り指名を全ホストから選べます（なしのままでもOK）。「済」はこの卓に着いたホスト。確定するとこの卓が空き、記録は履歴タブに残ります。
+        女の子ごとに送り指名を全ホストから選べます（なしでもOK）。決定すると送りカウントアップが始まり、回転タイマーは止まります。
       </div>
-
       {ses.girls.map((g, i) => {
         const gTags = {};
         (g.yobiIds || []).forEach((id) => { gTags[id] = [g.pos || ""]; });
         const notes = {};
         hosts.forEach((h) => { if (visitedIds.includes(h.id)) notes[h.id] = "済"; });
         return (
-          <div
-            key={i}
-            style={{
-              border: `1px solid ${C.line}`, borderRadius: 10,
-              padding: "12px", marginBottom: 10, background: `${C.surface2}66`,
-            }}
-          >
+          <div key={i} style={{ border: `1px solid ${C.line}`, borderRadius: 10, padding: "12px", marginBottom: 10, background: `${C.surface2}66` }}>
             <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
               <PosBadge pos={g.pos} />
-              <span style={{ fontSize: 13, fontWeight: 700, color: C.cyan }}>{g.name || "お客様"}</span>
               <span style={{ fontSize: 11, fontWeight: 700, marginLeft: "auto", color: okuri[i] ? C.goldBright : C.muted }}>
                 送り：{okuri[i] ? nameOf(okuri[i]) : "なし"}
               </span>
             </div>
-            <HostChips
-              list={hosts}
-              selected={okuri[i] ? [okuri[i]] : []}
-              onToggle={(id) => pick(i, id)}
-              max={1}
-              tags={gTags}
-              notes={notes}
-            />
+            <HostChips list={hosts} selected={okuri[i] ? [okuri[i]] : []} onToggle={(id) => pick(i, id)} max={1} tags={gTags} notes={notes} />
           </div>
         );
       })}
-
       <Btn kind="gold" onClick={() => onSubmit(okuri)} style={{ width: "100%", padding: 14, fontSize: 15 }}>
-        会計して卓を空ける
+        送りを決定（カウントアップ開始）
+      </Btn>
+    </div>
+  );
+};
+
+// ─── 飲み直しフォーム（送りの子が担当。2万/1万＋移動先＋姫名） ───
+const NominaoshiForm = ({ tableId, ses, hostById, freeTables, onSubmit }) => {
+  const nameOf = (id) => hostById(id)?.name || "—";
+  const okuriChosen = [...new Set((ses.okuriDecided || []).filter(Boolean))];
+  const [rows, setRows] = useState(okuriChosen.map((hid) => ({ hostId: hid, himeName: "", kind: "nomi2" })));
+  const [toTable, setToTable] = useState(tableId);
+  const setRow = (i, patch) => setRows((rs) => rs.map((r, j) => (j === i ? { ...r, ...patch } : r)));
+
+  const freeAll = [tableId, ...freeTables];
+  const groups = [];
+  freeAll.forEach((t) => { const k = t[0]; const g = groups.find((x) => x.k === k); if (g) g.items.push(t); else groups.push({ k, items: [t] }); });
+
+  return (
+    <div>
+      <div style={{ display: "flex", alignItems: "baseline", gap: 10, marginBottom: 6 }}>
+        <span style={{ fontFamily: "Oswald, sans-serif", fontSize: 26, fontWeight: 600, color: C.goldBright }}>{tableId}</span>
+        <span style={{ fontSize: 14, fontWeight: 700 }}>を飲み直し</span>
+      </div>
+      <div style={{ fontSize: 12, color: C.muted, marginBottom: 14 }}>
+        送りに選んだ子がそのまま担当になります。種類（2万＝フリータイム／1万＝90分）と姫名を入れ、卓を変える場合は移動先を選んでください。
+      </div>
+
+      <Field label="移動先の卓（そのままでもOK）">
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          {groups.map((g) => (
+            <div key={g.k} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <span style={{ fontFamily: "Oswald, sans-serif", fontSize: 14, fontWeight: 600, color: C.gold, width: 16, textAlign: "center" }}>{g.k}</span>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                {g.items.map((t) => (
+                  <button key={t} onClick={() => setToTable(t)} style={{
+                    background: toTable === t ? `${C.gold}22` : "transparent",
+                    border: `1px solid ${toTable === t ? C.gold : C.line}`, borderRadius: 8,
+                    padding: "7px 13px", cursor: "pointer",
+                    color: toTable === t ? C.goldBright : C.muted,
+                    fontFamily: "Oswald, sans-serif", fontSize: 13, fontWeight: 600,
+                  }}>{t}{t === tableId ? "(現卓)" : ""}</button>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      </Field>
+
+      {rows.map((r, i) => (
+        <div key={i} style={{ border: `1px solid ${C.line}`, borderRadius: 10, padding: "12px", marginBottom: 10, background: `${C.surface2}66` }}>
+          <div style={{ fontSize: 13, fontWeight: 700, color: C.goldBright, marginBottom: 10 }}>{nameOf(r.hostId)}</div>
+          <Field label="種類">
+            <div style={{ display: "flex", gap: 8 }}>
+              {[["nomi2","2万飲み直し","フリータイム"],["nomi1","1万飲み直し","90分制"]].map(([id,lb,sub]) => {
+                const col = KINDS[id].color;
+                return (
+                  <button key={id} onClick={() => setRow(i, { kind: id })} style={{
+                    flex: 1, padding: "10px 0", borderRadius: 8, fontSize: 12, fontWeight: 700,
+                    fontFamily: "'Zen Kaku Gothic New', sans-serif", cursor: "pointer",
+                    background: r.kind === id ? `${col}22` : "transparent",
+                    color: r.kind === id ? col : C.muted, border: `1px solid ${r.kind === id ? col : C.line}`,
+                  }}>{lb}<span style={{ fontSize: 9, display: "block", opacity: 0.8 }}>{sub}</span></button>
+                );
+              })}
+            </div>
+          </Field>
+          <Field label="姫の名前（任意）" style={{ marginBottom: 0 }}>
+            <input value={r.himeName} onChange={(e) => setRow(i, { himeName: e.target.value })} placeholder="登録名" style={inputStyle} />
+          </Field>
+        </div>
+      ))}
+
+      <Btn kind="gold" onClick={() => onSubmit(toTable, rows.map((r) => ({ ...r, himeName: r.himeName.trim() })))} style={{ width: "100%", padding: 14, fontSize: 15 }}>
+        飲み直しで指名へ（{rows.length}組）
       </Btn>
     </div>
   );
