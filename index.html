@@ -86,7 +86,7 @@ const DEFAULT_MIN = 5;
 // 指名の席区分
 const KINDS = {
   set:   { label: "セット", color: "#D8B45A", limitMin: null },     // 指名：着席時刻のみ
-  quick: { label: "クイック", color: "#5BC8DC", limitMin: 60 },     // 指名：60分
+  quick: { label: "クイック", color: "#5BC8DC", limitMin: 90 },     // 指名：90分
   peer:  { label: "同業", color: "#B07CF0", limitMin: 60 },         // 指名：60分
   nomi2: { label: "2万飲み直し", color: "#D8B45A", limitMin: null },// フリータイム＝着席時刻のみ
   nomi1: { label: "1万飲み直し", color: "#5BC8DC", limitMin: 90 },  // 90分（23時制限なし）
@@ -96,7 +96,7 @@ const QUICK_LAST_ORDER_H = 23;   // クイック提供は23時まで
 const QUICK_WARN_BEFORE_MS = 10 * 60 * 1000; // 10分前で赤
 
 // 席の時間状態を返す：{ text, alert }
-// セット＝着席時刻のみ。クイック/同業＝60分カウントダウン（50分で10分前赤）。
+// セット＝着席時刻のみ。クイック＝90分、同業＝60分カウントダウン（10分前で赤）。
 // クイックは 22:50一斉赤 も加わり、90分…ではなく早い方の赤。
 const seatTimeState = (now) => (seat) => {
   const k = KINDS[seat.kind] || KINDS.set;
